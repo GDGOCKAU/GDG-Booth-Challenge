@@ -24,6 +24,12 @@ const allowedOrigins = new Set([
   ...configuredOrigins,
   ...(process.env.NODE_ENV === "production" ? [] : ["http://localhost:5173", "http://127.0.0.1:5173"]),
 ].filter(Boolean));
+const corsOptions = {
+  origin(origin, callback) {
+    callback(null, !origin || allowedOrigins.has(origin));
+  },
+  credentials: true,
+};
 
 app.set("trust proxy", 1);
 app.use(helmet({
@@ -34,7 +40,8 @@ app.use(helmet({
     },
   },
 }));
-app.use(cors({ origin(origin, callback) { callback(null, !origin || allowedOrigins.has(origin)); }, credentials: true }));
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "6mb" }));
 app.use(cookieParser());
 app.use(session({
@@ -60,6 +67,7 @@ function secureEqual(a, b) {
 }
 
 function requireAdmin(req, res, next) {
+  if (req.method === "OPTIONS") return next();
   if (!req.session?.isAdmin) return res.status(401).json({ message: "Admin authentication required" });
   next();
 }
