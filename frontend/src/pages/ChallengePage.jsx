@@ -1,14 +1,29 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import CelebrationBurst from "../components/CelebrationBurst";
+import ConfirmDialog from "../components/ConfirmDialog";
+import DuplicateNameDialog from "../components/DuplicateNameDialog";
 import ErrorBanner from "../components/ErrorBanner";
 import LoadingDots from "../components/LoadingDots";
-import { ArrowIcon, CheckIcon, CloseIcon, TrophyIcon } from "../components/Icons";
+import { ArrowIcon, CheckIcon, ClockIcon, CloseIcon, TrophyIcon } from "../components/Icons";
 import { difficultyTheme } from "../theme";
 
 const FEEDBACK_DURATION_MS = 2400;
+const EXPLANATION_DURATION_MS = 5000;
+const IDLE_RESET_MS = 3 * 60 * 1000;
+const RESULT_RESET_MS = 30 * 1000;
+const SESSION_STORAGE_PREFIX = "gdg_booth_session:";
+
+function sessionStorageKey(challengeId) {
+  return `${SESSION_STORAGE_PREFIX}${challengeId}`;
+}
+
+function formatElapsed(seconds) {
+  const safeSeconds = Math.max(0, Number(seconds) || 0);
+  return `${Math.floor(safeSeconds / 60)}:${String(safeSeconds % 60).padStart(2, "0")}`;
+}
 
 function AnswerField({ question, value, onChange, disabled }) {
   const options = question.content?.options || [];
@@ -16,7 +31,7 @@ function AnswerField({ question, value, onChange, disabled }) {
   if (["multiple_choice", "true_false", "image"].includes(question.type)) {
     return (
       <div className="answer-options">
-        {question.content?.imageUrl && <img className="question-image" src={question.content.imageUrl} alt="Question visual" />}
+        {question.content?.imageUrl && <img className="question-image" src={question.content.imageUrl} alt={question.title || "Question visual"} />}
         {options.map((option, index) => {
           const key = question.type === "true_false" ? String(option) : String(index);
           return (
@@ -100,7 +115,13 @@ export default function ChallengePage() {
   const [loading, setLoading] = useState(!routedChallenge);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [duplicateParticipant, setDuplicateParticipant] = useState(null);
+  const [restoringSession, setRestoringSession] = useState(true);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [exitOpen, setExitOpen] = useState(false);
+  const [exiting, setExiting] = useState(false);
   const feedbackTimer = useRef(null);
+  const nameInput = useRef(null);
 
   useEffect(() => {
     if (routedChallenge) return undefined;
@@ -116,7 +137,62 @@ export default function ChallengePage() {
     return () => { cancelled = true; };
   }, [challengeId, routedChallenge]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const key = sessionStorageKey(challengeId);
+    const savedSessionId = sessionStorage.getItem(key);
+    if (!savedSessionId) {
+      setRestoringSession(false);
+      return undefined;
+    }
+
+    api(`/api/sessions/${savedSessionId}`)
+      .then((data) => {
+        if (cancelled) return;
+        if (data.result) {
+          setSession({ ...data.result, sessionId: savedSessionId });
+          setResult(data.result);
+          setStage("result");
+        } else if (data.question) {
+          setSession(data);
+          setAnswer(initialAnswer(data.question));
+          setStage("question");
+        } else {
+          sessionStorage.removeItem(key);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) sessionStorage.removeItem(key);
+      })
+      .finally(() => {
+        if (!cancelled) setRestoringSession(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [challengeId]);
+
   useEffect(() => () => clearTimeout(feedbackTimer.current), []);
+
+  useEffect(() => {
+    if (stage !== "question" || !session?.startedAt) {
+      setElapsedSeconds(0);
+      return undefined;
+    }
+    const startedAt = new Date(session.startedAt).getTime();
+    const tick = () => setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [session?.startedAt, stage]);
+
+  useEffect(() => {
+    if (stage !== "result") return undefined;
+    const timer = setTimeout(() => {
+      sessionStorage.removeItem(sessionStorageKey(challengeId));
+      navigate("/", { replace: true });
+    }, RESULT_RESET_MS);
+    return () => clearTimeout(timer);
+  }, [challengeId, navigate, stage]);
 
   const progress = session ? Math.round(((session.currentIndex || 0) / session.totalQuestions) * 100) : 0;
   const canSubmit = useMemo(
@@ -130,20 +206,73 @@ export default function ChallengePage() {
     "--challenge-accent-text": activeTheme.text,
   };
 
-  const begin = async () => {
+  const begin = async (confirmExistingName = false) => {
     setSubmitting(true);
     setError("");
     try {
-      const data = await api("/api/sessions", { method: "POST", body: JSON.stringify({ challengeId, displayName: name }) });
+      const data = await api("/api/sessions", { method: "POST", body: JSON.stringify({ challengeId, displayName: name, confirmExistingName }) });
+      sessionStorage.setItem(sessionStorageKey(challengeId), data.sessionId);
       setSession(data);
       setAnswer(initialAnswer(data.question));
       setStage("question");
     } catch (reason) {
-      setError(reason.message);
+      if (reason.code === "DISPLAY_NAME_EXISTS") setDuplicateParticipant(reason.details || { displayName: name });
+      else setError(reason.message);
     } finally {
       setSubmitting(false);
     }
   };
+
+  const useExistingParticipant = () => {
+    setDuplicateParticipant(null);
+    begin(true);
+  };
+
+  const writeAnotherName = () => {
+    setDuplicateParticipant(null);
+    setError("");
+    requestAnimationFrame(() => {
+      nameInput.current?.focus();
+      nameInput.current?.select();
+    });
+  };
+
+  const exitChallenge = useCallback(async () => {
+    if (exiting) return;
+    setExiting(true);
+    setError("");
+    try {
+      if (session?.sessionId) await api(`/api/sessions/${session.sessionId}`, { method: "DELETE" });
+      sessionStorage.removeItem(sessionStorageKey(challengeId));
+      clearTimeout(feedbackTimer.current);
+      setExitOpen(false);
+      setStage("intro");
+      setSession(null);
+      setResult(null);
+      setFeedback(null);
+      navigate("/", { replace: true });
+    } catch (reason) {
+      setError(reason.message);
+    } finally {
+      setExiting(false);
+    }
+  }, [challengeId, exiting, navigate, session?.sessionId]);
+
+  useEffect(() => {
+    if (stage !== "question" || !session?.sessionId) return undefined;
+    let timer;
+    const arm = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { exitChallenge(); }, IDLE_RESET_MS);
+    };
+    const activityEvents = ["pointerdown", "keydown", "touchstart"];
+    activityEvents.forEach((eventName) => window.addEventListener(eventName, arm));
+    arm();
+    return () => {
+      clearTimeout(timer);
+      activityEvents.forEach((eventName) => window.removeEventListener(eventName, arm));
+    };
+  }, [exitChallenge, session?.sessionId, stage]);
 
   const submit = async () => {
     if (!canSubmit || submitting) return;
@@ -152,15 +281,16 @@ export default function ChallengePage() {
     try {
       const data = await api(`/api/sessions/${session.sessionId}/answer`, { method: "POST", body: JSON.stringify({ answer }) });
       setFeedback(data.feedback);
+      const feedbackDuration = data.feedback?.explanation ? EXPLANATION_DURATION_MS : FEEDBACK_DURATION_MS;
       if (data.result) {
         setResult(data.result);
-        feedbackTimer.current = setTimeout(() => setStage("result"), FEEDBACK_DURATION_MS);
+        feedbackTimer.current = setTimeout(() => setStage("result"), feedbackDuration);
       } else if (data.currentIndex !== session.currentIndex) {
         feedbackTimer.current = setTimeout(() => {
           setSession((current) => ({ ...current, ...data }));
           setFeedback(null);
           setAnswer(initialAnswer(data.question));
-        }, FEEDBACK_DURATION_MS);
+        }, feedbackDuration);
       } else {
         setSession((current) => ({ ...current, ...data }));
       }
@@ -176,16 +306,16 @@ export default function ChallengePage() {
     setAnswer(initialAnswer(session.question));
   };
 
-  if (loading) return <div className="page-loader"><LoadingDots label="Opening challenge" size={10} /></div>;
+  if (loading || restoringSession) return <div className="page-loader"><LoadingDots label="Opening challenge" size={10} /></div>;
   if (!challenge) return <div className="center-state"><ErrorBanner message={error} /><Link className="secondary-button" to="/">Back home</Link></div>;
 
   if (stage === "intro") {
     return (
       <div className="challenge-theme challenge-stage page-enter" style={themeStyle}>
-        <button className="back-link" onClick={() => navigate("/")}>← Leaderboard</button>
+        <button className="back-link" onClick={() => navigate("/")}><ArrowIcon /> Back to leaderboard</button>
         <motion.section className="intro-card panel" initial={{ opacity: 0, y: 18, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ duration: 0.36 }}>
           <span className="challenge-hero-letter">{challenge.title[0]}</span>
-          <span className="eyebrow">{challenge.category} · {challenge.difficulty}</span>
+          <span className="eyebrow">{challenge.difficulty}</span>
           <h1>{challenge.title}</h1>
           <p>{challenge.description}</p>
           <div className="intro-meta">
@@ -196,13 +326,14 @@ export default function ChallengePage() {
           {challenge.startMessage && <div className="info-callout">{challenge.startMessage}</div>}
           <label className="field-label">
             Display name {challenge.requireName ? "" : <small>(optional)</small>}
-            <input className="text-input" maxLength="40" value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Sara" />
+            <input ref={nameInput} className="text-input" maxLength="40" value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Sara" autoComplete="off" />
           </label>
           <ErrorBanner message={error} />
-          <button className="primary-button difficulty-button large-button" onClick={begin} disabled={submitting || (challenge.requireName && !name.trim())}>
+          <button className="primary-button difficulty-button large-button" onClick={() => begin()} disabled={submitting || (challenge.requireName && !name.trim())}>
             {submitting ? <LoadingDots size={6} /> : <>Start challenge <ArrowIcon /></>}
           </button>
         </motion.section>
+        <DuplicateNameDialog participant={duplicateParticipant} onConfirm={useExistingParticipant} onRename={writeAnotherName} />
       </div>
     );
   }
@@ -223,7 +354,10 @@ export default function ChallengePage() {
             <span><CloseIcon /><strong>{result.incorrectCount}</strong> incorrect</span>
           </div>
           <h3>{result.completionMessage}</h3>
-          <button className="primary-button difficulty-button result-continue" onClick={() => navigate("/", { replace: true })}>Continue <ArrowIcon /></button>
+          <div className="result-actions">
+            <span className="result-time"><ClockIcon /> {formatElapsed(result.completionTimeSeconds)} total</span>
+            <button className="primary-button difficulty-button result-continue" onClick={() => { sessionStorage.removeItem(sessionStorageKey(challengeId)); navigate("/", { replace: true }); }}>Continue <ArrowIcon /></button>
+          </div>
         </motion.section>
       </div>
     );
@@ -237,7 +371,11 @@ export default function ChallengePage() {
     <div className="challenge-theme question-page page-enter" style={themeStyle}>
       <div className="question-top">
         <div><span className="eyebrow">{session.challengeTitle}</span><h1>Question {session.currentIndex + 1} <span>/ {session.totalQuestions}</span></h1></div>
-        <div className="score-pill"><small>Score</small><strong>{session.score}</strong></div>
+        <div className="question-actions">
+          <div className="timer-pill" aria-label={`Elapsed time ${formatElapsed(elapsedSeconds)}`}><ClockIcon /><small>Time</small><strong>{formatElapsed(elapsedSeconds)}</strong></div>
+          <button type="button" className="secondary-button exit-button" onClick={() => setExitOpen(true)} disabled={submitting || exiting}><CloseIcon /> Exit</button>
+          <div className="score-pill"><small>Score</small><strong>{session.score}</strong></div>
+        </div>
       </div>
       <div className="progress-track"><i style={{ width: `${progress}%` }} /></div>
       <motion.section key={question.id} className="question-card panel" initial={{ opacity: 0, x: 18 }} animate={{ opacity: 1, x: 0 }} transition={{ duration: 0.28 }}>
@@ -255,7 +393,7 @@ export default function ChallengePage() {
         <AnimatePresence mode="wait">
           {feedback && (
             <motion.div
-              className={`answer-feedback ${feedback.correct ? "correct" : "wrong"}`}
+              className={`answer-feedback ${feedback.correct ? "correct" : "wrong"} ${feedback.explanation ? "with-explanation" : ""}`}
               initial={{ opacity: 0, y: 10, scale: 0.98 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: -8 }}
@@ -265,6 +403,7 @@ export default function ChallengePage() {
               <div>
                 <strong>{feedback.correct ? `Correct! +${feedback.pointsAwarded} points` : "Not quite"}</strong>
                 <small>{feedback.correct ? "Moving to the next question" : feedback.exhausted ? "No attempts remaining — moving on" : `${feedback.attemptsRemaining} attempts remaining`}</small>
+                {feedback.explanation && <p className="feedback-explanation">{feedback.explanation}</p>}
               </div>
               {!feedback.correct && !feedback.exhausted && <button className="feedback-action" onClick={retry}>Try again</button>}
             </motion.div>
@@ -277,6 +416,14 @@ export default function ChallengePage() {
           </button>
         </div>
       </motion.section>
+      <ConfirmDialog
+        open={exitOpen}
+        title="Exit this challenge?"
+        message="Your current progress will be discarded and the next visitor can start fresh."
+        confirmLabel={exiting ? "Exiting…" : "Exit challenge"}
+        onCancel={() => setExitOpen(false)}
+        onConfirm={exitChallenge}
+      />
     </div>
   );
 }

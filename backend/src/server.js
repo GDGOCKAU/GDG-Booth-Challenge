@@ -11,20 +11,27 @@ import { pool, query, transaction } from "./db.js";
 import { evaluateQuestion, pointsForAttempt, publicQuestion } from "./scoring.js";
 
 if (!process.env.ADMIN_PASSWORD) throw new Error("ADMIN_PASSWORD is required");
+if (process.env.NODE_ENV === "production" && !process.env.SESSION_SECRET) throw new Error("SESSION_SECRET is required in production");
 
 const app = express();
 const PgStore = connectPgSimple(session);
 const PORT = Number(process.env.PORT || 4000);
 const allowedOrigins = new Set([
   process.env.FRONTEND_URL,
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
+  ...(process.env.NODE_ENV === "production" ? [] : ["http://localhost:5173", "http://127.0.0.1:5173"]),
 ].filter(Boolean));
 
 app.set("trust proxy", 1);
-app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  contentSecurityPolicy: {
+    directives: {
+      imgSrc: ["'self'", "data:", "blob:", "https:", "http:"],
+    },
+  },
+}));
 app.use(cors({ origin(origin, callback) { callback(null, !origin || allowedOrigins.has(origin)); }, credentials: true }));
-app.use(express.json({ limit: "256kb" }));
+app.use(express.json({ limit: "6mb" }));
 app.use(cookieParser());
 app.use(session({
   name: "gdg_booth_admin",
@@ -110,11 +117,14 @@ app.patch("/api/preferences", (req, res) => {
   res.json({ theme: theme === "dark" ? "Dark" : "Light" });
 });
 
+const sessionLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false, message: { message: "Too many booth requests. Please try again shortly." } });
+app.use("/api/sessions", sessionLimiter);
+
 app.get("/api/challenges", asyncRoute(async (_req, res) => {
   const result = await query(
-    `SELECT c.id, c.title, c.description, c.image_url AS "imageUrl", c.category, c.difficulty,
+    `SELECT c.id, c.title, c.description, c.image_url AS "imageUrl", c.difficulty,
        c.start_message AS "startMessage", c.require_name AS "requireName", c.leaderboard_enabled AS "leaderboardEnabled",
-       CASE WHEN c.selection_mode='manual' THEN COUNT(cq.question_id)::int
+       CASE WHEN c.selection_mode='manual' THEN COUNT(q.id)::int
             ELSE COALESCE((
               SELECT SUM(
                 CASE WHEN (rule->>'count') ~ '^[0-9]+$' THEN (rule->>'count')::int ELSE 0 END
@@ -128,7 +138,8 @@ app.get("/api/challenges", asyncRoute(async (_req, res) => {
               ) rule
             ),0)::int END AS "questionCount"
      FROM challenges c LEFT JOIN challenge_questions cq ON cq.challenge_id=c.id
-     WHERE c.is_active=TRUE GROUP BY c.id ORDER BY c.created_at`,
+       LEFT JOIN questions q ON q.id=cq.question_id AND q.is_active=TRUE
+       WHERE c.is_active=TRUE GROUP BY c.id ORDER BY c.created_at`,
   );
   res.json(result.rows);
 }));
@@ -137,13 +148,45 @@ app.get("/api/leaderboard", asyncRoute(async (req, res) => {
   const challengeId = req.query.challengeId ? requireId(req.query.challengeId) : null;
   const params = challengeId ? [challengeId] : [];
   const where = challengeId ? "AND s.challenge_id=$1" : "";
+  const maxRows = req.session?.isAdmin ? 500 : 50;
+  const requestedRows = Number.parseInt(req.query.limit, 10);
+  const rowLimit = Number.isInteger(requestedRows) ? Math.min(Math.max(requestedRows, 1), maxRows) : maxRows;
   const result = await query(
-    `SELECT s.id, s.display_name AS "displayName", s.challenge_title AS "challengeTitle", s.challenge_id AS "challengeId",
-       s.score, ROUND((s.score::numeric / NULLIF(s.total_possible,0))*100)::int AS percentage,
-       GREATEST(1, EXTRACT(EPOCH FROM (s.completed_at-s.started_at))::int) AS "completionTimeSeconds", s.completed_at AS "completedAt"
-     FROM challenge_sessions s JOIN challenges c ON c.id=s.challenge_id
-     WHERE s.status='completed' AND c.leaderboard_enabled=TRUE ${where}
-     ORDER BY percentage DESC, s.score DESC, "completionTimeSeconds" ASC, s.completed_at ASC LIMIT 50`,
+    `WITH eligible AS (
+       SELECT s.*,
+         LOWER(REGEXP_REPLACE(BTRIM(s.display_name), '\\s+', ' ', 'g')) AS name_key,
+         GREATEST(1, EXTRACT(EPOCH FROM (s.completed_at-s.started_at))::int) AS completion_seconds
+       FROM challenge_sessions s JOIN challenges c ON c.id=s.challenge_id
+       WHERE s.status='completed' AND c.leaderboard_enabled=TRUE ${where}
+     ), best_per_challenge AS (
+       SELECT DISTINCT ON (
+         CASE WHEN name_key='' OR name_key='guest' THEN id::text ELSE name_key END,
+         challenge_id
+       ) *,
+         CASE WHEN name_key='' OR name_key='guest' THEN id::text ELSE name_key END AS participant_key
+       FROM eligible
+       ORDER BY
+         CASE WHEN name_key='' OR name_key='guest' THEN id::text ELSE name_key END,
+         challenge_id,
+         score DESC,
+         completion_seconds ASC,
+         completed_at ASC,
+         id ASC
+     ), participants AS (
+       SELECT MIN(id::text) AS id,
+         (ARRAY_AGG(display_name ORDER BY started_at))[1] AS "displayName",
+         CASE WHEN COUNT(DISTINCT challenge_id)=1 THEN MIN(challenge_title)
+              ELSE COUNT(DISTINCT challenge_id)::text || ' challenges' END AS "challengeTitle",
+         CASE WHEN COUNT(DISTINCT challenge_id)=1 THEN MIN(challenge_id::text) ELSE NULL END AS "challengeId",
+         SUM(score)::int AS score,
+         ROUND((SUM(score)::numeric / NULLIF(SUM(total_possible),0))*100)::int AS percentage,
+         SUM(completion_seconds)::int AS "completionTimeSeconds",
+         MAX(completed_at) AS "completedAt"
+       FROM best_per_challenge
+       GROUP BY participant_key
+     )
+     SELECT * FROM participants
+     ORDER BY score DESC, percentage DESC, "completionTimeSeconds" ASC, "completedAt" ASC LIMIT ${rowLimit}`,
     params,
   );
   res.json(result.rows);
@@ -152,11 +195,34 @@ app.get("/api/leaderboard", asyncRoute(async (req, res) => {
 app.post("/api/sessions", asyncRoute(async (req, res) => {
   const challengeId = requireId(req.body?.challengeId);
   const rawName = cleanText(req.body?.displayName, 40);
+  const nameKey = rawName.replace(/\s+/g, " ").trim().toLocaleLowerCase("en");
+  const confirmedExistingName = req.body?.confirmExistingName === true;
   const payload = await transaction(async (client) => {
     const challengeResult = await client.query("SELECT * FROM challenges WHERE id=$1 AND is_active=TRUE FOR SHARE", [challengeId]);
     const challenge = challengeResult.rows[0];
     if (!challenge) { const error = new Error("Challenge is not available"); error.status = 404; throw error; }
     if (challenge.require_name && !rawName) { const error = new Error("Display name is required"); error.status = 400; throw error; }
+
+    let displayName = rawName || "Guest";
+    if (nameKey && nameKey !== "guest") {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [nameKey]);
+      const existing = (await client.query(
+        `SELECT (ARRAY_AGG(display_name ORDER BY started_at))[1] AS "displayName",
+           COUNT(*)::int AS "sessionCount",
+           COALESCE(MAX(score) FILTER (WHERE status='completed'),0)::int AS "existingScore"
+         FROM challenge_sessions
+         WHERE LOWER(REGEXP_REPLACE(BTRIM(display_name), '\\s+', ' ', 'g'))=$1 AND challenge_id=$2`,
+        [nameKey, challengeId],
+      )).rows[0];
+      if (existing.sessionCount > 0 && !confirmedExistingName) {
+        const error = new Error("This display name already exists");
+        error.status = 409;
+        error.publicCode = "DISPLAY_NAME_EXISTS";
+        error.details = existing;
+        throw error;
+      }
+      if (existing.sessionCount > 0) displayName = existing.displayName;
+    }
 
     let questions = [];
     if (challenge.selection_mode === "manual") {
@@ -178,15 +244,12 @@ app.post("/api/sessions", asyncRoute(async (req, res) => {
       }
     }
     if (!questions.length) { const error = new Error("This challenge has no available questions"); error.status = 409; throw error; }
-    const snapshots = questions.map((row) => ({
-      ...snapshotFromRow(row),
-      explanation: challenge.reveal_answers ? row.explanation : "",
-    }));
+    const snapshots = questions.map((row) => snapshotFromRow(row));
     const totalPossible = snapshots.reduce((sum, item) => sum + item.points, 0);
     const inserted = await client.query(
       `INSERT INTO challenge_sessions (challenge_id, challenge_title, display_name, total_possible)
        VALUES ($1,$2,$3,$4) RETURNING *`,
-      [challengeId, challenge.title, rawName || "Guest", totalPossible],
+      [challengeId, challenge.title, displayName, totalPossible],
     );
     const sessionRow = inserted.rows[0];
     await client.query(
@@ -196,12 +259,18 @@ app.post("/api/sessions", asyncRoute(async (req, res) => {
       [sessionRow.id, JSON.stringify(snapshots)],
     );
     return {
-      sessionId: sessionRow.id, challengeTitle: challenge.title, displayName: sessionRow.display_name,
+      sessionId: sessionRow.id, challengeTitle: challenge.title, displayName: sessionRow.display_name, startedAt: sessionRow.started_at,
       totalQuestions: snapshots.length, totalPossible, score: 0, currentIndex: 0,
       question: { ...publicQuestion(snapshots[0]), position: 0, attemptsUsed: 0, attemptsRemaining: snapshots[0].maxAttempts },
     };
   });
   res.status(201).json(payload);
+}));
+
+app.delete("/api/sessions/:id", asyncRoute(async (req, res) => {
+  const id = requireId(req.params.id);
+  await query("DELETE FROM challenge_sessions WHERE id=$1 AND status='in_progress'", [id]);
+  res.status(204).end();
 }));
 
 app.get("/api/sessions/:id", asyncRoute(async (req, res) => {
@@ -213,6 +282,7 @@ app.get("/api/sessions/:id", asyncRoute(async (req, res) => {
   const count = await query("SELECT COUNT(*)::int AS count FROM session_questions WHERE session_id=$1", [id]);
   res.json({
     sessionId: id, challengeTitle: session.challengeTitle, displayName: session.displayName,
+    startedAt: session.startedAt,
     totalQuestions: count.rows[0].count, totalPossible: session.totalPossible, score: session.score,
     currentIndex: current.rows[0]?.position || 0, question: current.rows[0] ? publicSessionQuestion(current.rows[0]) : null,
   });
@@ -275,7 +345,7 @@ app.post("/api/sessions/:id/answer", asyncRoute(async (req, res) => {
     );
     const feedback = {
       correct, pointsAwarded: awarded, attemptsRemaining: Math.max(0, sessionQuestion.snapshot.maxAttempts - attemptNumber),
-      exhausted, explanation: advance && sessionQuestion.snapshot.explanation ? sessionQuestion.snapshot.explanation : undefined,
+      exhausted, explanation: !correct && sessionQuestion.snapshot.explanation ? sessionQuestion.snapshot.explanation : undefined,
     };
     if (completed) return { feedback, result: await sessionResult(sessionId, client) };
     const current = advance
@@ -305,7 +375,7 @@ app.get("/api/admin/overview", asyncRoute(async (_req, res) => {
     (SELECT COUNT(*)::int FROM challenges WHERE is_active) AS "activeChallenges",
     (SELECT COUNT(*)::int FROM questions) AS "totalQuestions",
     (SELECT COUNT(*)::int FROM answer_attempts) AS "totalAttempts",
-    (SELECT COUNT(DISTINCT NULLIF(display_name,'Guest'))::int FROM challenge_sessions) AS "totalParticipants",
+    (SELECT COUNT(DISTINCT NULLIF(LOWER(REGEXP_REPLACE(BTRIM(display_name), '\\s+', ' ', 'g')),'guest'))::int FROM challenge_sessions) AS "totalParticipants",
     COALESCE((SELECT ROUND(AVG(score::numeric/NULLIF(total_possible,0)*100))::int FROM challenge_sessions WHERE status='completed'),0) AS "averageScore"`);
   res.json(result.rows[0]);
 }));
@@ -344,7 +414,7 @@ app.post("/api/admin/questions/:id/duplicate", asyncRoute(async (req, res) => {
 app.delete("/api/admin/questions/:id", asyncRoute(async (req, res) => { await query("DELETE FROM questions WHERE id=$1", [requireId(req.params.id)]); res.status(204).end(); }));
 
 app.get("/api/admin/challenges", asyncRoute(async (_req, res) => {
-  const result = await query(`SELECT c.id,c.title,c.description,c.image_url AS "imageUrl",c.category,c.difficulty,c.is_active AS "isActive",c.selection_mode AS "selectionMode",c.random_rules AS "randomRules",c.start_message AS "startMessage",c.completion_message AS "completionMessage",c.require_name AS "requireName",c.leaderboard_enabled AS "leaderboardEnabled",c.reveal_answers AS "revealAnswers",COALESCE(array_agg(cq.question_id ORDER BY cq.position) FILTER (WHERE cq.question_id IS NOT NULL),'{}') AS "questionIds" FROM challenges c LEFT JOIN challenge_questions cq ON cq.challenge_id=c.id GROUP BY c.id ORDER BY c.created_at DESC`);
+  const result = await query(`SELECT c.id,c.title,c.description,c.image_url AS "imageUrl",c.difficulty,c.is_active AS "isActive",c.selection_mode AS "selectionMode",c.random_rules AS "randomRules",c.start_message AS "startMessage",c.completion_message AS "completionMessage",c.require_name AS "requireName",c.leaderboard_enabled AS "leaderboardEnabled",COALESCE(array_agg(cq.question_id ORDER BY cq.position) FILTER (WHERE cq.question_id IS NOT NULL),'{}') AS "questionIds" FROM challenges c LEFT JOIN challenge_questions cq ON cq.challenge_id=c.id GROUP BY c.id ORDER BY c.created_at DESC`);
   res.json(result.rows);
 }));
 
@@ -363,7 +433,7 @@ function challengeInput(body) {
   return {
     // node-postgres serializes JS arrays as PostgreSQL arrays (an empty one becomes `{}`).
     // Send JSON text explicitly so the jsonb column always receives `[]` / `[{...}]`.
-    values: [title, cleanText(body.description, 2000), cleanText(body.imageUrl, 1000), cleanText(body.category, 80) || "General", cleanText(body.difficulty, 40) || "Easy", bool(body.isActive, true), mode, JSON.stringify(randomRules), cleanText(body.startMessage, 500), cleanText(body.completionMessage, 500), bool(body.requireName), bool(body.leaderboardEnabled, true), bool(body.revealAnswers)],
+    values: [title, cleanText(body.description, 2000), cleanText(body.imageUrl, 1000), "General", cleanText(body.difficulty, 40) || "Easy", bool(body.isActive, true), mode, JSON.stringify(randomRules), cleanText(body.startMessage, 500), cleanText(body.completionMessage, 500), bool(body.requireName), bool(body.leaderboardEnabled, true), false],
     questionIds: Array.isArray(body.questionIds) ? [...new Set(body.questionIds.filter((id) => idPattern.test(id)))].slice(0, 100) : [],
   };
 }
@@ -406,7 +476,10 @@ app.delete("/api/admin/results", asyncRoute(async (_req, res) => { await query("
 
 app.use((error, _req, res, _next) => {
   console.error(error);
-  res.status(error.status || 500).json({ message: error.status ? error.message : "Something went wrong on the server" });
+  const body = { message: error.status ? error.message : "Something went wrong on the server" };
+  if (error.publicCode) body.code = error.publicCode;
+  if (error.details) body.details = error.details;
+  res.status(error.status || 500).json(body);
 });
 
 app.listen(PORT, () => {

@@ -34,6 +34,10 @@ A compact booth challenge platform with a live leaderboard, anonymous visitor se
 
 Open `http://localhost:5173`. Organizer access is at `http://localhost:5173/admin` and is validated by the backend using `ADMIN_PASSWORD`.
 
+## Production on rocks.quest
+
+For a simple deployment, serve the frontend and proxy `/api` to the backend under the same HTTPS origin. Build the frontend with `VITE_API_URL` empty (the production fallback uses same-origin requests), set the backend `FRONTEND_URL=https://rocks.quest`, `NODE_ENV=production`, and provide a long random `SESSION_SECRET`. Run `npm run db:init` once against the production database before starting the API. If the API must live on another site, set `VITE_API_URL` to that HTTPS URL and configure cross-site cookies plus CSRF protection before using the admin dashboard.
+
 ## Supported questions
 
 - Multiple choice

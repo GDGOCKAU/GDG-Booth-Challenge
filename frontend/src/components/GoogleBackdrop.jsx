@@ -14,10 +14,10 @@ export default function GoogleBackdrop() {
         animate={slowTurn}
         transition={{ duration: 70, repeat: Infinity, ease: "linear" }}
       >
-        <circle cx="350" cy="70" r="178" stroke="#4285F4" />
-        <circle cx="350" cy="70" r="128" stroke="#EA4335" />
-        <circle cx="286" cy="132" r="178" stroke="#FBBC04" />
-        <circle cx="286" cy="132" r="98" stroke="#34A853" />
+        <circle cx="275" cy="170" r="150" stroke="#4285F4" />
+        <circle cx="275" cy="170" r="108" stroke="#EA4335" />
+        <circle cx="218" cy="212" r="150" stroke="#FBBC04" />
+        <circle cx="218" cy="212" r="82" stroke="#34A853" />
       </motion.svg>
       <motion.svg
         className="google-rings rings-bottom"
@@ -25,10 +25,10 @@ export default function GoogleBackdrop() {
         animate={reduceMotion ? undefined : { rotate: -360 }}
         transition={{ duration: 80, repeat: Infinity, ease: "linear" }}
       >
-        <circle cx="72" cy="294" r="150" stroke="#34A853" />
-        <circle cx="72" cy="294" r="106" stroke="#FBBC04" />
-        <circle cx="130" cy="238" r="145" stroke="#EA4335" />
-        <circle cx="130" cy="238" r="78" stroke="#4285F4" />
+        <circle cx="142" cy="210" r="130" stroke="#34A853" />
+        <circle cx="142" cy="210" r="92" stroke="#FBBC04" />
+        <circle cx="202" cy="150" r="130" stroke="#EA4335" />
+        <circle cx="202" cy="150" r="70" stroke="#4285F4" />
       </motion.svg>
       <motion.span className="google-shape shape-blue" animate={slowDrift} transition={{ duration: 7, repeat: Infinity, ease: "easeInOut" }} />
       <motion.span className="google-shape shape-red" animate={slowDrift} transition={{ duration: 8, delay: 1, repeat: Infinity, ease: "easeInOut" }} />
