@@ -16,8 +16,12 @@ if (process.env.NODE_ENV === "production" && !process.env.SESSION_SECRET) throw 
 const app = express();
 const PgStore = connectPgSimple(session);
 const PORT = Number(process.env.PORT || 4000);
+const configuredOrigins = String(process.env.CORS_ORIGIN || process.env.FRONTEND_URL || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 const allowedOrigins = new Set([
-  process.env.FRONTEND_URL,
+  ...configuredOrigins,
   ...(process.env.NODE_ENV === "production" ? [] : ["http://localhost:5173", "http://127.0.0.1:5173"]),
 ].filter(Boolean));
 
