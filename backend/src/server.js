@@ -8,7 +8,7 @@ import connectPgSimple from "connect-pg-simple";
 import { rateLimit } from "express-rate-limit";
 import "dotenv/config";
 import { pool, query, transaction } from "./db.js";
-import { evaluateQuestion, pointsForAttempt, publicQuestion } from "./scoring.js";
+import { correctAnswerForDisplay, evaluateQuestion, pointsForAttempt, publicQuestion } from "./scoring.js";
 
 if (!process.env.ADMIN_PASSWORD) throw new Error("ADMIN_PASSWORD is required");
 if (process.env.NODE_ENV === "production" && !process.env.SESSION_SECRET) throw new Error("SESSION_SECRET is required in production");
@@ -358,6 +358,7 @@ app.post("/api/sessions/:id/answer", asyncRoute(async (req, res) => {
     const feedback = {
       correct, pointsAwarded: awarded, attemptsRemaining: Math.max(0, sessionQuestion.snapshot.maxAttempts - attemptNumber),
       exhausted, explanation: !correct && sessionQuestion.snapshot.explanation ? sessionQuestion.snapshot.explanation : undefined,
+      correctAnswer: !correct && exhausted ? correctAnswerForDisplay(sessionQuestion.snapshot) : undefined,
     };
     if (completed) return { feedback, result: await sessionResult(sessionId, client) };
     const current = advance

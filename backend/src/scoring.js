@@ -44,3 +44,27 @@ export function publicQuestion(snapshot) {
   const { answer: _answer, explanation: _explanation, ...safe } = snapshot;
   return safe;
 }
+
+export function correctAnswerForDisplay(question) {
+  const answer = question.answer || {};
+  const options = question.content?.options || [];
+
+  switch (question.type) {
+    case "multiple_choice":
+    case "image":
+      return String(options[Number(answer.correct)] ?? answer.correct ?? "");
+    case "true_false":
+      return String(answer.correct).toLocaleLowerCase() === "true" ? "True" : "False";
+    case "multiple_select":
+      return (Array.isArray(answer.correct) ? answer.correct : [])
+        .map((index) => options[Number(index)] ?? index)
+        .map(String)
+        .join(", ");
+    case "short_answer":
+    case "code_output":
+    case "code_fix":
+      return String((answer.accepted || [])[0] ?? "").trim();
+    default:
+      return "";
+  }
+}

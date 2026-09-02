@@ -332,9 +332,15 @@ select:focus, .search-input:focus { border: 2px solid #3A7CF5; }
 .question-image { display: block; width: auto; height: auto; max-width: min(100%, 680px); max-height: min(42vh, 380px); object-fit: contain; justify-self: center; border-radius: 12px; margin: 0 auto 10px; }
 .answer-feedback { display: flex; align-items: center; gap: 11px; padding: 13px 15px; border-radius: 10px; margin-top: 16px; }
 .answer-feedback.with-explanation { align-items: flex-start; }.answer-feedback.with-explanation > svg { margin-top: 2px; flex: 0 0 auto; }
-.answer-feedback.correct { color: #2E7D32; background: #E8F5E9; }.answer-feedback.wrong { color: #B71C1C; background: #FFEBEE; }
-:root.dark .answer-feedback.correct { color: #4ADE80; background: rgba(52,168,83,.15); }:root.dark .answer-feedback.wrong { color: #FCA5A5; background: rgba(234,67,53,.15); }
-.answer-feedback div { display: flex; flex-direction: column; }.answer-feedback small { font-size: 11px; opacity: .8; }
+.answer-feedback.correct { color: #2E7D32; background: #E8F5E9; }.answer-feedback.wrong { color: #B71C1C; background: #F1F3F4; border: 1px solid #E0E0E0; }
+:root.dark .answer-feedback.correct { color: #4ADE80; background: rgba(52,168,83,.15); }:root.dark .answer-feedback.wrong { color: #FCA5A5; background: #2A2A2A; border-color: #3C3C3C; }
+.answer-feedback div { display: flex; flex-direction: column; }.answer-feedback > div { flex: 1; min-width: 0; }.answer-feedback small { font-size: 11px; opacity: .8; }
+.answer-feedback .feedback-correct-answer { margin: 9px 0 0; padding-top: 9px; border-top: 1px solid #E0E0E0; display: flex; align-items: baseline; gap: 7px; color: #3C4043; font-size: 13px; line-height: 1.5; }
+.answer-feedback .feedback-correct-answer b { color: #5F6368; font: 700 11px 'Roboto'; text-transform: uppercase; letter-spacing: .45px; }
+.answer-feedback .feedback-correct-answer span { color: #1C1B1F; font: 600 13px 'DM Sans'; white-space: pre-wrap; overflow-wrap: anywhere; }
+:root.dark .answer-feedback .feedback-correct-answer { border-color: #3C3C3C; color: #CCCCCC; }
+:root.dark .answer-feedback .feedback-correct-answer b { color: #AAAAAA; }
+:root.dark .answer-feedback .feedback-correct-answer span { color: #E0E0E0; }
 .answer-feedback .feedback-explanation { margin: 9px 0 0; padding-top: 9px; border-top: 1px solid currentColor; color: inherit; font-size: 13px; line-height: 1.5; opacity: .9; }
 .feedback-action { margin-left: auto; padding: 7px 12px; border-radius: 8px; border: 1px solid currentColor; color: inherit; background: transparent; cursor: pointer; font: 600 12px 'DM Sans'; transition: .15s; }
 .feedback-action:hover { background: rgba(255,255,255,.45); }

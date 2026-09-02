@@ -111,6 +111,7 @@ export default function ChallengePage() {
   const [session, setSession] = useState(null);
   const [answer, setAnswer] = useState("");
   const [feedback, setFeedback] = useState(null);
+  const [pendingAdvance, setPendingAdvance] = useState(null);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(!routedChallenge);
   const [submitting, setSubmitting] = useState(false);
@@ -214,6 +215,8 @@ export default function ChallengePage() {
       sessionStorage.setItem(sessionStorageKey(challengeId), data.sessionId);
       setSession(data);
       setAnswer(initialAnswer(data.question));
+      setPendingAdvance(null);
+      setFeedback(null);
       setStage("question");
     } catch (reason) {
       if (reason.code === "DISPLAY_NAME_EXISTS") setDuplicateParticipant(reason.details || { displayName: name });
@@ -250,6 +253,7 @@ export default function ChallengePage() {
       setSession(null);
       setResult(null);
       setFeedback(null);
+      setPendingAdvance(null);
       navigate("/", { replace: true });
     } catch (reason) {
       setError(reason.message);
@@ -282,7 +286,10 @@ export default function ChallengePage() {
       const data = await api(`/api/sessions/${session.sessionId}/answer`, { method: "POST", body: JSON.stringify({ answer }) });
       setFeedback(data.feedback);
       const feedbackDuration = data.feedback?.explanation ? EXPLANATION_DURATION_MS : FEEDBACK_DURATION_MS;
-      if (data.result) {
+      const needsManualAdvance = !data.feedback?.correct && data.feedback?.exhausted;
+      if (needsManualAdvance) {
+        setPendingAdvance(data);
+      } else if (data.result) {
         setResult(data.result);
         feedbackTimer.current = setTimeout(() => setStage("result"), feedbackDuration);
       } else if (data.currentIndex !== session.currentIndex) {
@@ -304,6 +311,20 @@ export default function ChallengePage() {
   const retry = () => {
     setFeedback(null);
     setAnswer(initialAnswer(session.question));
+  };
+
+  const advanceAfterExhaustion = () => {
+    if (!pendingAdvance) return;
+    clearTimeout(feedbackTimer.current);
+    if (pendingAdvance.result) {
+      setResult(pendingAdvance.result);
+      setStage("result");
+    } else {
+      setSession((current) => ({ ...current, ...pendingAdvance }));
+      setAnswer(initialAnswer(pendingAdvance.question));
+    }
+    setFeedback(null);
+    setPendingAdvance(null);
   };
 
   if (loading || restoringSession) return <div className="page-loader"><LoadingDots label="Opening challenge" size={10} /></div>;
@@ -366,6 +387,8 @@ export default function ChallengePage() {
   const question = session.question;
   const penaltyApplied = Number(question.attemptsUsed || 0) * Number(question.penalty || 0);
   const availablePoints = Math.max(0, Number(question.points || 0) - penaltyApplied);
+  const attemptsRemaining = feedback?.exhausted ? 0 : question.attemptsRemaining;
+  const showNextQuestion = Boolean(feedback?.exhausted && pendingAdvance);
 
   return (
     <div className="challenge-theme question-page page-enter" style={themeStyle}>
@@ -384,7 +407,7 @@ export default function ChallengePage() {
           <span className={penaltyApplied ? "points-value reduced" : "points-value"}>
             {penaltyApplied ? <><s>{question.points}</s> − {penaltyApplied} = <strong>{availablePoints}</strong> points</> : <>{question.points} points</>}
           </span>
-          <span>{question.attemptsRemaining} attempt{question.attemptsRemaining === 1 ? "" : "s"} left</span>
+          <span>{attemptsRemaining} attempt{attemptsRemaining === 1 ? "" : "s"} left</span>
         </div>
         <h2>{question.title}</h2>
         {question.description && <p>{question.description}</p>}
@@ -393,7 +416,7 @@ export default function ChallengePage() {
         <AnimatePresence mode="wait">
           {feedback && (
             <motion.div
-              className={`answer-feedback ${feedback.correct ? "correct" : "wrong"} ${feedback.explanation ? "with-explanation" : ""}`}
+              className={`answer-feedback ${feedback.correct ? "correct" : "wrong"} ${feedback.explanation || feedback.correctAnswer ? "with-explanation" : ""}`}
               initial={{ opacity: 0, y: 10, scale: 0.98 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: -8 }}
@@ -402,7 +425,10 @@ export default function ChallengePage() {
               {feedback.correct ? <CheckIcon /> : <CloseIcon />}
               <div>
                 <strong>{feedback.correct ? `Correct! +${feedback.pointsAwarded} points` : "Not quite"}</strong>
-                <small>{feedback.correct ? "Moving to the next question" : feedback.exhausted ? "No attempts remaining — moving on" : `${feedback.attemptsRemaining} attempts remaining`}</small>
+                <small>{feedback.correct ? "Moving to the next question" : feedback.exhausted ? "No attempts remaining — review the correct answer, then continue." : `${feedback.attemptsRemaining} attempts remaining`}</small>
+                {feedback.exhausted && feedback.correctAnswer && (
+                  <p className="feedback-correct-answer"><b>Correct answer</b><span>{feedback.correctAnswer}</span></p>
+                )}
                 {feedback.explanation && <p className="feedback-explanation">{feedback.explanation}</p>}
               </div>
               {!feedback.correct && !feedback.exhausted && <button className="feedback-action" onClick={retry}>Try again</button>}
@@ -410,9 +436,13 @@ export default function ChallengePage() {
           )}
         </AnimatePresence>
         <div className="question-footer">
-          <span>Answer carefully — wrong attempts may reduce points.</span>
-          <button className="primary-button difficulty-button" disabled={!canSubmit || submitting || Boolean(feedback)} onClick={submit}>
-            {submitting ? <LoadingDots size={6} /> : <>Submit answer <ArrowIcon /></>}
+          <span>{showNextQuestion ? "Review the correct answer above, then continue." : "Answer carefully — wrong attempts may reduce points."}</span>
+          <button
+            className="primary-button difficulty-button"
+            disabled={showNextQuestion ? false : !canSubmit || submitting || Boolean(feedback)}
+            onClick={showNextQuestion ? advanceAfterExhaustion : submit}
+          >
+            {submitting ? <LoadingDots size={6} /> : showNextQuestion ? <>{pendingAdvance.result ? "View results" : "Next question"} <ArrowIcon /></> : <>Submit answer <ArrowIcon /></>}
           </button>
         </div>
       </motion.section>
