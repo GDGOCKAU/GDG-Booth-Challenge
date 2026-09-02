@@ -1,0 +1,37 @@
+name: Deploy GDG Booth
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Deploy application
+        run: |
+          set -e
+
+          cd /home/arthur/Documents/SecondS/VSCode/GDG-Booth-Challenge
+
+          echo "Pulling latest changes..."
+          git fetch origin
+          git reset --hard origin/master
+
+          echo "Installing backend dependencies..."
+          cd backend
+          npm ci
+          pm2 restart gdg-booth-api --update-env
+
+          echo "Building frontend..."
+          cd ../frontend
+          npm ci
+          npm run build
+
+          echo "Restarting frontend..."
+          sudo -n systemctl restart gdg-booth-frontend
+
+          echo "Deployment completed."
+
