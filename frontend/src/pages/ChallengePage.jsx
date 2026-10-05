@@ -122,6 +122,7 @@ export default function ChallengePage() {
   const [exitOpen, setExitOpen] = useState(false);
   const [exiting, setExiting] = useState(false);
   const feedbackTimer = useRef(null);
+  const expiryCheckInFlight = useRef(false);
   const nameInput = useRef(null);
 
   useEffect(() => {
@@ -185,6 +186,22 @@ export default function ChallengePage() {
     const timer = setInterval(tick, 1000);
     return () => clearInterval(timer);
   }, [session?.startedAt, stage]);
+
+  useEffect(() => {
+    if (stage !== "question" || !session?.timeLimitSeconds || elapsedSeconds < session.timeLimitSeconds || expiryCheckInFlight.current) return;
+    expiryCheckInFlight.current = true;
+    api(`/api/sessions/${session.sessionId}`)
+      .then((data) => {
+        if (!data.result) return;
+        clearTimeout(feedbackTimer.current);
+        setResult(data.result);
+        setFeedback(null);
+        setPendingAdvance(null);
+        setStage("result");
+      })
+      .catch((reason) => setError(reason.message))
+      .finally(() => { expiryCheckInFlight.current = false; });
+  }, [elapsedSeconds, session?.sessionId, session?.timeLimitSeconds, stage]);
 
   useEffect(() => {
     if (stage !== "result") return undefined;
@@ -284,6 +301,12 @@ export default function ChallengePage() {
     setError("");
     try {
       const data = await api(`/api/sessions/${session.sessionId}/answer`, { method: "POST", body: JSON.stringify({ answer }) });
+      if (data.result?.timedOut) {
+        clearTimeout(feedbackTimer.current);
+        setResult(data.result);
+        setStage("result");
+        return;
+      }
       setFeedback(data.feedback);
       const feedbackDuration = data.feedback?.explanation ? EXPLANATION_DURATION_MS : FEEDBACK_DURATION_MS;
       const needsManualAdvance = !data.feedback?.correct && data.feedback?.exhausted;
@@ -341,7 +364,7 @@ export default function ChallengePage() {
           <p>{challenge.description}</p>
           <div className="intro-meta">
             <span><strong>{challenge.questionCount}</strong> questions</span>
-            <span><strong>Fast</strong> booth format</span>
+            <span><strong>{challenge.timeLimitSeconds ? formatElapsed(challenge.timeLimitSeconds) : "Fast"}</strong> {challenge.timeLimitSeconds ? "time limit" : "booth format"}</span>
             <span><strong>Live</strong> leaderboard</span>
           </div>
           {challenge.startMessage && <div className="info-callout">{challenge.startMessage}</div>}
@@ -360,13 +383,13 @@ export default function ChallengePage() {
   }
 
   if (stage === "result") {
-    const won = Number(result.percentage) >= 60;
+    const won = !result.timedOut && Number(result.percentage) >= 60;
     return (
       <div className="challenge-theme challenge-stage page-enter" style={themeStyle}>
         <motion.section className={`result-card panel ${won ? "result-win" : "result-loss"}`} initial={{ opacity: 0, y: 20, scale: 0.94 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ type: "spring", stiffness: 210, damping: 18 }}>
           <CelebrationBurst active={won} />
           <motion.span className="result-icon" initial={{ scale: 0, rotate: -18 }} animate={{ scale: 1, rotate: 0 }} transition={{ type: "spring", delay: 0.15, stiffness: 260, damping: 14 }}><TrophyIcon /></motion.span>
-          <span className="eyebrow">Challenge completed</span>
+          <span className="eyebrow">{result.timedOut ? "Time is up" : "Challenge completed"}</span>
           <h1>{result.challengeTitle}</h1>
           <p>{result.displayName}</p>
           <div className="result-score"><strong>{result.score}</strong><span>/ {result.totalPossible}</span><small>{result.percentage}%</small></div>
@@ -374,7 +397,7 @@ export default function ChallengePage() {
             <span><CheckIcon /><strong>{result.correctCount}</strong> correct</span>
             <span><CloseIcon /><strong>{result.incorrectCount}</strong> incorrect</span>
           </div>
-          <h3>{result.completionMessage}</h3>
+          <h3>{result.timedOut ? "Your time has ended." : result.completionMessage}</h3>
           <div className="result-actions">
             <span className="result-time"><ClockIcon /> {formatElapsed(result.completionTimeSeconds)} total</span>
             <button className="primary-button difficulty-button result-continue" onClick={() => { sessionStorage.removeItem(sessionStorageKey(challengeId)); navigate("/", { replace: true }); }}>Continue <ArrowIcon /></button>
@@ -389,17 +412,22 @@ export default function ChallengePage() {
   const availablePoints = Math.max(0, Number(question.points || 0) - penaltyApplied);
   const attemptsRemaining = feedback?.exhausted ? 0 : question.attemptsRemaining;
   const showNextQuestion = Boolean(feedback?.exhausted && pendingAdvance);
+  const timeLimitSeconds = Number(session.timeLimitSeconds) || 0;
+  const remainingSeconds = Math.max(0, timeLimitSeconds - elapsedSeconds);
+  const remainingPercent = timeLimitSeconds ? (remainingSeconds / timeLimitSeconds) * 100 : 0;
+  const timerColor = remainingPercent <= 15 ? "#EA4335" : remainingPercent <= 50 ? "#FBBC04" : "#34A853";
 
   return (
     <div className="challenge-theme question-page page-enter" style={themeStyle}>
       <div className="question-top">
         <div><span className="eyebrow">{session.challengeTitle}</span><h1>Question {session.currentIndex + 1} <span>/ {session.totalQuestions}</span></h1></div>
         <div className="question-actions">
-          <div className="timer-pill" aria-label={`Elapsed time ${formatElapsed(elapsedSeconds)}`}><ClockIcon /><small>Time</small><strong>{formatElapsed(elapsedSeconds)}</strong></div>
+          {timeLimitSeconds > 0 && <div className="timer-pill countdown-pill" style={{ "--timer-color": timerColor }} aria-label={`Time remaining ${formatElapsed(remainingSeconds)}`}><ClockIcon /><small>Left</small><strong>{formatElapsed(remainingSeconds)}</strong></div>}
           <button type="button" className="secondary-button exit-button" onClick={() => setExitOpen(true)} disabled={submitting || exiting}><CloseIcon /> Exit</button>
           <div className="score-pill"><small>Score</small><strong>{session.score}</strong></div>
         </div>
       </div>
+      {timeLimitSeconds > 0 && <div className="countdown-track" role="progressbar" aria-label="Time remaining" aria-valuenow={Math.round(remainingPercent)} aria-valuemin="0" aria-valuemax="100" style={{ "--timer-color": timerColor }}><i style={{ width: `${remainingPercent}%` }} /></div>}
       <div className="progress-track"><i style={{ width: `${progress}%` }} /></div>
       <motion.section key={question.id} className="question-card panel" initial={{ opacity: 0, x: 18 }} animate={{ opacity: 1, x: 0 }} transition={{ duration: 0.28 }}>
         <div className="question-meta">

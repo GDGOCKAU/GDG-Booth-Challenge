@@ -301,12 +301,18 @@ select:focus, .search-input:focus { border: 2px solid #3A7CF5; }
 .question-actions { display: flex; align-items: center; gap: 8px; }
 .timer-pill { min-height: 40px; padding: 8px 12px; border-radius: 10px; display: inline-flex; align-items: center; gap: 7px; color: var(--challenge-accent, #3A7CF5); background: color-mix(in srgb, var(--challenge-accent, #3A7CF5) 12%, transparent); border: 1px solid color-mix(in srgb, var(--challenge-accent, #3A7CF5) 34%, var(--border)); }
 .timer-pill svg { width: 16px; height: 16px; }.timer-pill small { color: var(--muted); font-size: 11px; }.timer-pill strong { min-width: 36px; font: 700 15px 'JetBrains Mono', monospace; letter-spacing: .5px; }
+.timer-pill.countdown-pill { color: var(--timer-color); background: color-mix(in srgb, var(--timer-color) 12%, var(--surface)); border-color: color-mix(in srgb, var(--timer-color) 34%, var(--border)); transition: color .25s, background .25s, border-color .25s; }
+.countdown-track { height: 9px; margin: 17px 0 0; border-radius: 100px; overflow: hidden; background: color-mix(in srgb, var(--timer-color) 13%, var(--surface-alt)); transition: background .25s; }
+.countdown-track i { display: block; height: 100%; border-radius: inherit; background: var(--timer-color); transition: width 1s linear, background .25s; }
+.countdown-track + .progress-track { margin-top: 10px; }
 .exit-button { min-height: 40px; padding-inline: 12px; color: #C62828; border-color: #FFCDD2; background: transparent; }.exit-button svg { width: 14px; height: 14px; }
 :root.dark .exit-button { color: #FCA5A5; border-color: rgba(234,67,53,.35); }
 .score-pill { min-width: 90px; padding: 8px 14px; border-radius: 10px; background: color-mix(in srgb, var(--challenge-accent, #3A7CF5) 13%, transparent); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .score-pill small { color: var(--muted); }.score-pill strong { color: var(--challenge-accent, #3A7CF5); font-size: 20px; }
 .progress-track { height: 6px; border-radius: 100px; overflow: hidden; background: var(--border); margin: 17px 0 24px; }
 .progress-track i { display: block; height: 100%; border-radius: inherit; background: var(--challenge-accent, #34A853); transition: width .5s, background .25s; }
+.timer-setting { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-alt); }
+.timer-setting .admin-field { max-width: 210px; }
 .question-card { padding: 28px; }
 .question-meta { display: flex; align-items: center; gap: 10px; color: var(--faint); font-size: 11px; }
 .question-meta > span:not(:last-child)::after { content: '·'; margin-left: 10px; color: var(--border); }

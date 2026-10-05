@@ -113,8 +113,25 @@ async function sessionResult(sessionId, client = pool) {
     correctCount: row.correct_count, incorrectCount: row.incorrect_count,
     percentage, status: row.status, completionMessage: row.completion_message || "Challenge complete!",
     startedAt: row.started_at, completedAt: row.completed_at,
+    timeLimitSeconds: row.time_limit_seconds,
+    timedOut: row.timed_out,
     completionTimeSeconds: row.completed_at ? Math.max(1, Math.round((new Date(row.completed_at) - new Date(row.started_at)) / 1000)) : null,
   };
+}
+
+async function finishExpiredSession(client, row) {
+  if (row.status !== "in_progress" || !row.time_limit_seconds) return false;
+  const deadline = new Date(row.started_at).getTime() + row.time_limit_seconds * 1000;
+  if (Date.now() < deadline) return false;
+  const unfinished = await client.query(
+    "UPDATE session_questions SET is_correct=FALSE WHERE session_id=$1 AND is_correct IS NULL RETURNING position",
+    [row.id],
+  );
+  await client.query(
+    "UPDATE challenge_sessions SET status='completed', incorrect_count=incorrect_count+$2, completed_at=$3, timed_out=TRUE WHERE id=$1",
+    [row.id, unfinished.rowCount, new Date(deadline)],
+  );
+  return true;
 }
 
 app.get("/api/health", asyncRoute(async (_req, res) => {
@@ -136,6 +153,7 @@ app.get("/api/challenges", asyncRoute(async (_req, res) => {
   const result = await query(
     `SELECT c.id, c.title, c.description, c.image_url AS "imageUrl", c.difficulty,
        c.start_message AS "startMessage", c.require_name AS "requireName", c.leaderboard_enabled AS "leaderboardEnabled",
+       c.time_limit_seconds AS "timeLimitSeconds",
        CASE WHEN c.selection_mode='manual' THEN COUNT(q.id)::int
             ELSE COALESCE((
               SELECT SUM(
@@ -259,9 +277,9 @@ app.post("/api/sessions", asyncRoute(async (req, res) => {
     const snapshots = questions.map((row) => snapshotFromRow(row));
     const totalPossible = snapshots.reduce((sum, item) => sum + item.points, 0);
     const inserted = await client.query(
-      `INSERT INTO challenge_sessions (challenge_id, challenge_title, display_name, total_possible)
-       VALUES ($1,$2,$3,$4) RETURNING *`,
-      [challengeId, challenge.title, displayName, totalPossible],
+      `INSERT INTO challenge_sessions (challenge_id, challenge_title, display_name, total_possible, time_limit_seconds)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [challengeId, challenge.title, displayName, totalPossible, challenge.time_limit_seconds],
     );
     const sessionRow = inserted.rows[0];
     await client.query(
@@ -272,6 +290,7 @@ app.post("/api/sessions", asyncRoute(async (req, res) => {
     );
     return {
       sessionId: sessionRow.id, challengeTitle: challenge.title, displayName: sessionRow.display_name, startedAt: sessionRow.started_at,
+      timeLimitSeconds: sessionRow.time_limit_seconds,
       totalQuestions: snapshots.length, totalPossible, score: 0, currentIndex: 0,
       question: { ...publicQuestion(snapshots[0]), position: 0, attemptsUsed: 0, attemptsRemaining: snapshots[0].maxAttempts },
     };
@@ -287,6 +306,10 @@ app.delete("/api/sessions/:id", asyncRoute(async (req, res) => {
 
 app.get("/api/sessions/:id", asyncRoute(async (req, res) => {
   const id = requireId(req.params.id);
+  await transaction(async (client) => {
+    const locked = await client.query("SELECT * FROM challenge_sessions WHERE id=$1 FOR UPDATE", [id]);
+    if (locked.rows[0]) await finishExpiredSession(client, locked.rows[0]);
+  });
   const session = await sessionResult(id);
   if (!session) return res.status(404).json({ message: "Session not found" });
   if (session.status === "completed") return res.json({ result: session });
@@ -295,6 +318,7 @@ app.get("/api/sessions/:id", asyncRoute(async (req, res) => {
   res.json({
     sessionId: id, challengeTitle: session.challengeTitle, displayName: session.displayName,
     startedAt: session.startedAt,
+    timeLimitSeconds: session.timeLimitSeconds,
     totalQuestions: count.rows[0].count, totalPossible: session.totalPossible, score: session.score,
     currentIndex: current.rows[0]?.position || 0, question: current.rows[0] ? publicSessionQuestion(current.rows[0]) : null,
   });
@@ -320,6 +344,7 @@ app.post("/api/sessions/:id/answer", asyncRoute(async (req, res) => {
     const activeSession = sessionResultRow.rows[0];
     if (!activeSession) { const error = new Error("Session not found"); error.status = 404; throw error; }
     if (activeSession.status === "completed") return { result: await sessionResult(sessionId, client) };
+    if (await finishExpiredSession(client, activeSession)) return { result: await sessionResult(sessionId, client) };
     if (!activeSession.question_snapshot) { const error = new Error("Question not found"); error.status = 409; throw error; }
     const sessionQuestion = {
       position: activeSession.question_position,
@@ -427,7 +452,7 @@ app.post("/api/admin/questions/:id/duplicate", asyncRoute(async (req, res) => {
 app.delete("/api/admin/questions/:id", asyncRoute(async (req, res) => { await query("DELETE FROM questions WHERE id=$1", [requireId(req.params.id)]); res.status(204).end(); }));
 
 app.get("/api/admin/challenges", asyncRoute(async (_req, res) => {
-  const result = await query(`SELECT c.id,c.title,c.description,c.image_url AS "imageUrl",c.difficulty,c.is_active AS "isActive",c.selection_mode AS "selectionMode",c.random_rules AS "randomRules",c.start_message AS "startMessage",c.completion_message AS "completionMessage",c.require_name AS "requireName",c.leaderboard_enabled AS "leaderboardEnabled",COALESCE(array_agg(cq.question_id ORDER BY cq.position) FILTER (WHERE cq.question_id IS NOT NULL),'{}') AS "questionIds" FROM challenges c LEFT JOIN challenge_questions cq ON cq.challenge_id=c.id GROUP BY c.id ORDER BY c.created_at DESC`);
+  const result = await query(`SELECT c.id,c.title,c.description,c.image_url AS "imageUrl",c.difficulty,c.is_active AS "isActive",c.selection_mode AS "selectionMode",c.random_rules AS "randomRules",c.start_message AS "startMessage",c.completion_message AS "completionMessage",c.require_name AS "requireName",c.leaderboard_enabled AS "leaderboardEnabled",c.time_limit_seconds AS "timeLimitSeconds",COALESCE(array_agg(cq.question_id ORDER BY cq.position) FILTER (WHERE cq.question_id IS NOT NULL),'{}') AS "questionIds" FROM challenges c LEFT JOIN challenge_questions cq ON cq.challenge_id=c.id GROUP BY c.id ORDER BY c.created_at DESC`);
   res.json(result.rows);
 }));
 
@@ -443,10 +468,15 @@ function challengeInput(body) {
     difficulty: cleanText(rule?.difficulty, 40),
     count: integer(rule?.count, 1, 1, 100),
   }));
+  const timeLimitSeconds = body.timeLimitSeconds == null || body.timeLimitSeconds === ""
+    ? null : Number(body.timeLimitSeconds);
+  if (timeLimitSeconds !== null && (!Number.isInteger(timeLimitSeconds) || timeLimitSeconds < 60 || timeLimitSeconds > 86400)) {
+    const error = new Error("Time limit must be between 1 minute and 24 hours"); error.status = 400; throw error;
+  }
   return {
     // node-postgres serializes JS arrays as PostgreSQL arrays (an empty one becomes `{}`).
     // Send JSON text explicitly so the jsonb column always receives `[]` / `[{...}]`.
-    values: [title, cleanText(body.description, 2000), cleanText(body.imageUrl, 1000), "General", cleanText(body.difficulty, 40) || "Easy", bool(body.isActive, true), mode, JSON.stringify(randomRules), cleanText(body.startMessage, 500), cleanText(body.completionMessage, 500), bool(body.requireName), bool(body.leaderboardEnabled, true), false],
+    values: [title, cleanText(body.description, 2000), cleanText(body.imageUrl, 1000), "General", cleanText(body.difficulty, 40) || "Easy", bool(body.isActive, true), mode, JSON.stringify(randomRules), cleanText(body.startMessage, 500), cleanText(body.completionMessage, 500), bool(body.requireName), bool(body.leaderboardEnabled, true), false, timeLimitSeconds],
     questionIds: Array.isArray(body.questionIds) ? [...new Set(body.questionIds.filter((id) => idPattern.test(id)))].slice(0, 100) : [],
   };
 }
@@ -459,20 +489,20 @@ async function syncChallengeQuestions(client, challengeId, ids) {
 app.post("/api/admin/challenges", asyncRoute(async (req, res) => {
   const input = challengeInput(req.body || {});
   const id = await transaction(async (client) => {
-    const inserted = await client.query(`INSERT INTO challenges (title,description,image_url,category,difficulty,is_active,selection_mode,random_rules,start_message,completion_message,require_name,leaderboard_enabled,reveal_answers) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`, input.values);
+    const inserted = await client.query(`INSERT INTO challenges (title,description,image_url,category,difficulty,is_active,selection_mode,random_rules,start_message,completion_message,require_name,leaderboard_enabled,reveal_answers,time_limit_seconds) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`, input.values);
     await syncChallengeQuestions(client, inserted.rows[0].id, input.questionIds); return inserted.rows[0].id;
   });
   res.status(201).json({ id });
 }));
 app.put("/api/admin/challenges/:id", asyncRoute(async (req, res) => {
   const id = requireId(req.params.id); const input = challengeInput(req.body || {});
-  await transaction(async (client) => { await client.query(`UPDATE challenges SET title=$1,description=$2,image_url=$3,category=$4,difficulty=$5,is_active=$6,selection_mode=$7,random_rules=$8,start_message=$9,completion_message=$10,require_name=$11,leaderboard_enabled=$12,reveal_answers=$13,updated_at=NOW() WHERE id=$14`, [...input.values, id]); await syncChallengeQuestions(client, id, input.questionIds); });
+  await transaction(async (client) => { await client.query(`UPDATE challenges SET title=$1,description=$2,image_url=$3,category=$4,difficulty=$5,is_active=$6,selection_mode=$7,random_rules=$8,start_message=$9,completion_message=$10,require_name=$11,leaderboard_enabled=$12,reveal_answers=$13,time_limit_seconds=$14,updated_at=NOW() WHERE id=$15`, [...input.values, id]); await syncChallengeQuestions(client, id, input.questionIds); });
   res.json({ id });
 }));
 app.post("/api/admin/challenges/:id/duplicate", asyncRoute(async (req, res) => {
   const sourceId = requireId(req.params.id);
   const id = await transaction(async (client) => {
-    const inserted = await client.query(`INSERT INTO challenges (title,description,image_url,category,difficulty,is_active,selection_mode,random_rules,start_message,completion_message,require_name,leaderboard_enabled,reveal_answers) SELECT title||' (Copy)',description,image_url,category,difficulty,FALSE,selection_mode,random_rules,start_message,completion_message,require_name,leaderboard_enabled,reveal_answers FROM challenges WHERE id=$1 RETURNING id`, [sourceId]);
+    const inserted = await client.query(`INSERT INTO challenges (title,description,image_url,category,difficulty,is_active,selection_mode,random_rules,start_message,completion_message,require_name,leaderboard_enabled,reveal_answers,time_limit_seconds) SELECT title||' (Copy)',description,image_url,category,difficulty,FALSE,selection_mode,random_rules,start_message,completion_message,require_name,leaderboard_enabled,reveal_answers,time_limit_seconds FROM challenges WHERE id=$1 RETURNING id`, [sourceId]);
     if (!inserted.rows[0]) { const error = new Error("Challenge not found"); error.status = 404; throw error; }
     await client.query(`INSERT INTO challenge_questions (challenge_id,question_id,position) SELECT $1,question_id,position FROM challenge_questions WHERE challenge_id=$2`, [inserted.rows[0].id, sourceId]); return inserted.rows[0].id;
   });

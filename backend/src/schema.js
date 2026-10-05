@@ -34,9 +34,12 @@ CREATE TABLE IF NOT EXISTS challenges (
   require_name BOOLEAN NOT NULL DEFAULT FALSE,
   leaderboard_enabled BOOLEAN NOT NULL DEFAULT TRUE,
   reveal_answers BOOLEAN NOT NULL DEFAULT FALSE,
+  time_limit_seconds INTEGER CHECK (time_limit_seconds > 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE challenges ADD COLUMN IF NOT EXISTS time_limit_seconds INTEGER;
 
 -- Normalize legacy rows that stored one random rule as an object instead of an array.
 UPDATE challenges
@@ -80,8 +83,13 @@ CREATE TABLE IF NOT EXISTS challenge_sessions (
   incorrect_count INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','completed')),
   started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  completed_at TIMESTAMPTZ
+  completed_at TIMESTAMPTZ,
+  time_limit_seconds INTEGER CHECK (time_limit_seconds > 0),
+  timed_out BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+ALTER TABLE challenge_sessions ADD COLUMN IF NOT EXISTS time_limit_seconds INTEGER;
+ALTER TABLE challenge_sessions ADD COLUMN IF NOT EXISTS timed_out BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS session_questions (
   session_id UUID NOT NULL REFERENCES challenge_sessions(id) ON DELETE CASCADE,
