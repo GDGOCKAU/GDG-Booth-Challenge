@@ -42,7 +42,10 @@ app.use(helmet({
 }));
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
-app.use(express.json({ limit: "6mb" }));
+const IMPORT_PATH = "/api/admin/import";
+const defaultJson = express.json({ limit: "6mb" });
+// Imports carry whole question banks (with embedded images); they get a larger limit, parsed only after admin auth.
+app.use((req, res, next) => (req.path === IMPORT_PATH ? next() : defaultJson(req, res, next)));
 app.use(cookieParser());
 app.use(session({
   name: "gdg_booth_admin",
@@ -509,6 +512,132 @@ app.post("/api/admin/challenges/:id/duplicate", asyncRoute(async (req, res) => {
   res.status(201).json({ id });
 }));
 app.delete("/api/admin/challenges/:id", asyncRoute(async (req, res) => { await query("DELETE FROM challenges WHERE id=$1", [requireId(req.params.id)]); res.status(204).end(); }));
+
+function importError(message) { const error = new Error(message); error.status = 400; return error; }
+
+// Validates every row up front so an import is all-or-nothing; reports the spreadsheet row number (header = row 1).
+function validateRows(rows, toRecord) {
+  if (!Array.isArray(rows) || !rows.length) throw importError("The file has no rows to import");
+  if (rows.length > 5000) throw importError("Import at most 5000 rows at a time");
+  const byId = new Map();
+  const problems = [];
+  rows.forEach((row, index) => {
+    try {
+      const record = toRecord(row || {});
+      if (record) byId.set(record.id, record);
+    } catch (error) {
+      problems.push(`Row ${index + 2}: ${error.message}`);
+    }
+  });
+  if (problems.length) throw importError(`Nothing was imported. ${problems.slice(0, 5).join(" · ")}${problems.length > 5 ? ` · and ${problems.length - 5} more` : ""}`);
+  return [...byId.values()];
+}
+
+const importId = (value) => (idPattern.test(String(value || "").trim()) ? String(value).trim().toLowerCase() : crypto.randomUUID());
+
+function importTimestamp(value, label) {
+  if (value === "" || value == null) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error(`${label} is not a valid date`);
+  return date.toISOString();
+}
+
+async function importQuestions(client, rows) {
+  const records = validateRows(rows, (row) => {
+    const [title, description, type, category, difficulty, points, maxAttempts, penalty, explanation, isActive, content, answer] = questionInput(row);
+    return { id: importId(row.id), title, description, type, category, difficulty, points, max_attempts: maxAttempts, penalty, explanation, is_active: isActive, content, answer };
+  });
+  const result = await client.query(
+    `INSERT INTO questions (id,title,description,type,category,difficulty,points,max_attempts,penalty,explanation,is_active,content,answer)
+     SELECT id,title,description,type,category,difficulty,points,max_attempts,penalty,explanation,is_active,content,answer
+     FROM jsonb_to_recordset($1::jsonb) AS r(id uuid,title text,description text,type text,category text,difficulty text,points int,max_attempts int,penalty int,explanation text,is_active boolean,content jsonb,answer jsonb)
+     ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,description=EXCLUDED.description,type=EXCLUDED.type,category=EXCLUDED.category,
+       difficulty=EXCLUDED.difficulty,points=EXCLUDED.points,max_attempts=EXCLUDED.max_attempts,penalty=EXCLUDED.penalty,
+       explanation=EXCLUDED.explanation,is_active=EXCLUDED.is_active,content=EXCLUDED.content,answer=EXCLUDED.answer,updated_at=NOW()
+     RETURNING (xmax = 0) AS inserted`,
+    [JSON.stringify(records)],
+  );
+  const inserted = result.rows.filter((row) => row.inserted).length;
+  return { inserted, updated: result.rowCount - inserted, skipped: 0, warnings: [] };
+}
+
+async function importChallenges(client, rows) {
+  const records = validateRows(rows, (row) => {
+    const { values, questionIds } = challengeInput(row);
+    const [title, description, imageUrl, category, difficulty, isActive, mode, randomRules, startMessage, completionMessage, requireName, leaderboardEnabled, revealAnswers, timeLimitSeconds] = values;
+    return {
+      id: importId(row.id), title, description, image_url: imageUrl, category, difficulty, is_active: isActive, selection_mode: mode,
+      random_rules: JSON.parse(randomRules), start_message: startMessage, completion_message: completionMessage, require_name: requireName,
+      leaderboard_enabled: leaderboardEnabled, reveal_answers: revealAnswers, time_limit_seconds: timeLimitSeconds, question_ids: questionIds,
+    };
+  });
+  const result = await client.query(
+    `INSERT INTO challenges (id,title,description,image_url,category,difficulty,is_active,selection_mode,random_rules,start_message,completion_message,require_name,leaderboard_enabled,reveal_answers,time_limit_seconds)
+     SELECT id,title,description,image_url,category,difficulty,is_active,selection_mode,random_rules,start_message,completion_message,require_name,leaderboard_enabled,reveal_answers,time_limit_seconds
+     FROM jsonb_to_recordset($1::jsonb) AS r(id uuid,title text,description text,image_url text,category text,difficulty text,is_active boolean,selection_mode text,random_rules jsonb,start_message text,completion_message text,require_name boolean,leaderboard_enabled boolean,reveal_answers boolean,time_limit_seconds int)
+     ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,description=EXCLUDED.description,image_url=EXCLUDED.image_url,category=EXCLUDED.category,
+       difficulty=EXCLUDED.difficulty,is_active=EXCLUDED.is_active,selection_mode=EXCLUDED.selection_mode,random_rules=EXCLUDED.random_rules,
+       start_message=EXCLUDED.start_message,completion_message=EXCLUDED.completion_message,require_name=EXCLUDED.require_name,
+       leaderboard_enabled=EXCLUDED.leaderboard_enabled,reveal_answers=EXCLUDED.reveal_answers,time_limit_seconds=EXCLUDED.time_limit_seconds,updated_at=NOW()
+     RETURNING (xmax = 0) AS inserted`,
+    [JSON.stringify(records.map(({ question_ids: _ids, ...record }) => record))],
+  );
+  const links = records.flatMap((record) => record.question_ids.map((questionId, position) => ({ challenge_id: record.id, question_id: questionId, position })));
+  await client.query("DELETE FROM challenge_questions WHERE challenge_id = ANY($1::uuid[])", [records.map((record) => record.id)]);
+  const linked = await client.query(
+    `INSERT INTO challenge_questions (challenge_id,question_id,position)
+     SELECT r.challenge_id, r.question_id, r.position
+     FROM jsonb_to_recordset($1::jsonb) AS r(challenge_id uuid, question_id uuid, position int)
+     JOIN questions q ON q.id = r.question_id`,
+    [JSON.stringify(links)],
+  );
+  const missing = links.length - linked.rowCount;
+  const inserted = result.rows.filter((row) => row.inserted).length;
+  return {
+    inserted, updated: result.rowCount - inserted, skipped: 0,
+    warnings: missing ? [`${missing} question link(s) were skipped because those questions don't exist yet. Import the question bank first, then import challenges again.`] : [],
+  };
+}
+
+async function importResults(client, rows) {
+  let skippedInProgress = 0;
+  const records = validateRows(rows, (row) => {
+    if (String(row.status || "").trim().toLowerCase() !== "completed") { skippedInProgress += 1; return null; }
+    const challengeTitle = cleanText(row.challengeTitle, 200);
+    if (!challengeTitle) throw new Error("Challenge is required");
+    const startedAt = importTimestamp(row.startedAt, "Started at");
+    const completedAt = importTimestamp(row.completedAt, "Completed at");
+    if (!startedAt || !completedAt) throw new Error("Started at and Completed at are required");
+    return {
+      id: importId(row.id), challenge_title: challengeTitle, display_name: cleanText(row.displayName, 40) || "Guest",
+      score: integer(row.score, 0, 0, 1000000), total_possible: integer(row.totalPossible, 0, 0, 1000000), started_at: startedAt, completed_at: completedAt,
+    };
+  });
+  if (!records.length) throw importError("The file has no completed results to import");
+  const result = await client.query(
+    `INSERT INTO challenge_sessions (id,challenge_id,challenge_title,display_name,score,total_possible,status,started_at,completed_at)
+     SELECT r.id, (SELECT c.id FROM challenges c WHERE c.title = r.challenge_title ORDER BY c.created_at LIMIT 1),
+       r.challenge_title, r.display_name, r.score, r.total_possible, 'completed', r.started_at, r.completed_at
+     FROM jsonb_to_recordset($1::jsonb) AS r(id uuid,challenge_title text,display_name text,score int,total_possible int,started_at timestamptz,completed_at timestamptz)
+     ON CONFLICT (id) DO NOTHING
+     RETURNING challenge_id`,
+    [JSON.stringify(records)],
+  );
+  const unmatched = result.rows.filter((row) => !row.challenge_id).length;
+  const warnings = [];
+  if (skippedInProgress) warnings.push(`${skippedInProgress} unfinished session(s) were skipped.`);
+  if (unmatched) warnings.push(`${unmatched} result(s) didn't match a challenge title, so they won't appear on the leaderboard. Import challenges first.`);
+  return { inserted: result.rowCount, updated: 0, skipped: records.length - result.rowCount + skippedInProgress, warnings };
+}
+
+const importers = { questions: importQuestions, challenges: importChallenges, results: importResults };
+
+app.post(IMPORT_PATH, express.json({ limit: "50mb" }), asyncRoute(async (req, res) => {
+  const importer = importers[req.body?.kind];
+  if (!importer) throw importError("Unknown import type");
+  const summary = await transaction((client) => importer(client, req.body.rows));
+  res.json(summary);
+}));
 
 app.get("/api/admin/results", asyncRoute(async (_req, res) => {
   const result = await query(`SELECT id,display_name AS "displayName",challenge_title AS "challengeTitle",score,total_possible AS "totalPossible",ROUND((score::numeric/NULLIF(total_possible,0))*100)::int AS percentage,status,started_at AS "startedAt",completed_at AS "completedAt" FROM challenge_sessions ORDER BY started_at DESC LIMIT 500`);

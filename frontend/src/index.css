@@ -218,6 +218,10 @@ select:focus, .search-input:focus { border: 2px solid #3A7CF5; }
 .challenge-card:hover .challenge-arrow { opacity: 1; transform: none; }
 .error-banner { padding: 11px 14px; margin: 10px 0; border-radius: 10px; border: 1px solid #FFCDD2; color: #C62828; background: #FFEBEE; font-size: 13px; }
 :root.dark .error-banner { color: #FCA5A5; border-color: rgba(234,67,53,.35); background: rgba(234,67,53,.12); }
+.success-banner { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 11px 14px; margin: 10px 0; border-radius: 10px; border: 1px solid #C8E6C9; color: #1B5E20; background: #E8F5E9; font-size: 13px; }
+.success-banner ul { margin: 6px 0 0; padding-inline-start: 18px; }
+.success-banner button { background: none; border: 0; color: inherit; cursor: pointer; padding: 0; display: inline-flex; }
+:root.dark .success-banner { color: #A7F3D0; border-color: rgba(52,168,83,.35); background: rgba(52,168,83,.12); }
 .page-loader, .center-state { min-height: calc(100vh - 68px); display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 16px; }
 
 .challenge-stage { min-height: calc(100vh - 68px); padding: 28px; display: flex; flex-direction: column; align-items: center; justify-content: center; }

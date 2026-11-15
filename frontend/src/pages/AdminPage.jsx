@@ -1,4 +1,4 @@
-import React, { useContext, useEffect, useMemo, useState } from "react";
+import React, { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import { ThemeContext } from "../App";
@@ -10,9 +10,10 @@ import Logo from "../components/Logo";
 import StatusBadge from "../components/StatusBadge";
 import ThemeToggle from "../components/ThemeToggle";
 import QuestionForm from "../components/AdminQuestionForm";
-import { CloseIcon, DownloadIcon, MenuIcon } from "../components/Icons";
+import { CloseIcon, DownloadIcon, MenuIcon, UploadIcon } from "../components/Icons";
 import { GOOGLE } from "../theme";
 import { downloadCsv, downloadXlsx } from "../utils/exportData";
+import { parseCsv, readXlsx, rowsToObjects } from "../utils/importData";
 
 const types = ["multiple_choice", "multiple_select", "short_answer", "code_output", "code_fix", "image", "true_false"];
 const difficulties = ["Easy", "Medium", "Hard", "Impossible"];
@@ -35,6 +36,65 @@ const challengeQuestionCount = (challenge) => challenge.selectionMode === "manua
 const answerSummary = (question) => {
   if (Array.isArray(question.answer?.accepted)) return question.answer.accepted.join(" | ");
   return question.answer?.correct ?? "";
+};
+
+const yes = (value) => /^(yes|true|1)$/i.test(String(value ?? "").trim());
+const parseJsonCell = (value, label, fallback) => {
+  const text = String(value ?? "").trim();
+  if (!text) return fallback;
+  try { return JSON.parse(text); } catch { throw new Error(`${label} is not valid JSON`); }
+};
+// Excel turns dates it recognises into serial day numbers; convert them back to ISO strings.
+const importDate = (value) => typeof value === "number" ? new Date(Math.round((value - 25569) * 86400000)).toISOString() : String(value ?? "").trim();
+const requireColumns = (records, columns, label) => {
+  if (!records.length) throw new Error(`The ${label} file has no data rows.`);
+  const missing = columns.filter((column) => !(column in records[0]));
+  if (missing.length) throw new Error(`This doesn't look like a ${label} export (missing column: ${missing.join(", ")}).`);
+};
+const withRowNumber = (records, map) => records.map((row, index) => {
+  try { return map(row); } catch (reason) { throw new Error(`Row ${index + 2}: ${reason.message}`); }
+});
+const importers = {
+  questions: {
+    label: "question bank", accept: ".csv,text/csv",
+    async read(file) {
+      const records = rowsToObjects(parseCsv(await file.text()));
+      requireColumns(records, ["ID", "Title", "Type", "Content JSON", "Answer JSON"], "question bank");
+      return withRowNumber(records, (row) => ({
+        id: row.ID, title: row.Title, description: row.Description, type: row.Type, category: row.Category, difficulty: row.Difficulty,
+        points: row.Points, maxAttempts: row["Max attempts"], penalty: row.Penalty, isActive: yes(row.Active), explanation: row.Explanation,
+        content: parseJsonCell(row["Content JSON"], "Content JSON", {}), answer: parseJsonCell(row["Answer JSON"], "Answer JSON", {}),
+      }));
+    },
+  },
+  challenges: {
+    label: "challenges", accept: ".csv,text/csv",
+    async read(file) {
+      const records = rowsToObjects(parseCsv(await file.text()));
+      requireColumns(records, ["ID", "Title", "Selection mode", "Question IDs", "Random rules"], "challenges");
+      return withRowNumber(records, (row) => ({
+        id: row.ID, title: row.Title, description: row.Description, imageUrl: row["Image URL"], difficulty: row.Difficulty, isActive: yes(row.Active),
+        selectionMode: row["Selection mode"], questionIds: String(row["Question IDs"] || "").split("|").map((id) => id.trim()).filter(Boolean),
+        randomRules: parseJsonCell(row["Random rules"], "Random rules", []), leaderboardEnabled: yes(row["Leaderboard visible"]),
+        requireName: yes(row["Require display name"]),
+        timeLimitSeconds: String(row["Time limit (seconds)"] ?? "").trim() === "" ? null : Number(row["Time limit (seconds)"]),
+        startMessage: row["Start message"], completionMessage: row["Completion message"],
+      }));
+    },
+  },
+  results: {
+    label: "results", accept: ".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    async read(file) {
+      const sheets = await readXlsx(await file.arrayBuffer());
+      if (!sheets.Submissions) throw new Error("This doesn't look like a results export (no Submissions sheet).");
+      const records = rowsToObjects(sheets.Submissions);
+      requireColumns(records, ["ID", "Participant", "Challenge", "Score", "Status", "Started at", "Completed at"], "results");
+      return records.map((row) => ({
+        id: row.ID, displayName: row.Participant, challengeTitle: row.Challenge, score: row.Score, totalPossible: row["Total possible"],
+        status: row.Status, startedAt: importDate(row["Started at"]), completedAt: importDate(row["Completed at"]),
+      }));
+    },
+  },
 };
 
 function Field({ label, children, hint }) { return <label className="admin-field"><span>{label}</span>{children}{hint && <small>{hint}</small>}</label>; }
@@ -78,6 +138,7 @@ function Overview({ data }) { const cards = [["Total challenges", data.totalChal
 export default function AdminPage() {
   const { darkMode, toggleTheme, savingTheme } = useContext(ThemeContext); const [auth, setAuth] = useState(null); const [password, setPassword] = useState(""); const [loginError, setLoginError] = useState(""); const [loggingIn, setLoggingIn] = useState(false);
   const [tab, setTab] = useState("overview"); const [menuOpen, setMenuOpen] = useState(false); const [data, setData] = useState({ overview: {}, challenges: [], questions: [], results: [], leaderboard: [] }); const [loading, setLoading] = useState(false); const [error, setError] = useState(""); const [editor, setEditor] = useState(null); const [deleteTarget, setDeleteTarget] = useState(null); const [search, setSearch] = useState("");
+  const fileInput = useRef(null); const [pendingImport, setPendingImport] = useState(null); const [importing, setImporting] = useState(false); const [notice, setNotice] = useState(null);
   useEffect(() => { api("/api/admin/me").then((value) => setAuth(value.authenticated)).catch(() => setAuth(false)); }, []);
   useEffect(() => {
     if (auth !== false) return undefined;
@@ -92,6 +153,24 @@ export default function AdminPage() {
   const duplicate = async (kind, id) => { try { await api(`/api/admin/${kind}/${id}/duplicate`, { method: "POST" }); await load(); } catch (reason) { setError(reason.message); } };
   const filteredQuestions = useMemo(() => data.questions.filter((question) => `${question.title} ${question.category} ${question.type}`.toLowerCase().includes(search.toLowerCase())), [data.questions, search]);
   const filteredResults = useMemo(() => data.results.filter((result) => `${result.displayName} ${result.challengeTitle}`.toLowerCase().includes(search.toLowerCase())), [data.results, search]);
+  const chooseImportFile = () => { setError(""); setNotice(null); if (fileInput.current) { fileInput.current.value = ""; fileInput.current.accept = importers[tab].accept; fileInput.current.click(); } };
+  const readImportFile = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const kind = tab;
+    try { const rows = await importers[kind].read(file); setPendingImport({ kind, rows, fileName: file.name }); }
+    catch (reason) { setError(reason.message || "This file could not be read."); }
+  };
+  const runImport = async () => {
+    const job = pendingImport; setPendingImport(null); setImporting(true); setError(""); setNotice(null);
+    try {
+      const summary = await api("/api/admin/import", { method: "POST", body: JSON.stringify({ kind: job.kind, rows: job.rows }) });
+      const parts = [`${summary.inserted} added`, summary.updated ? `${summary.updated} updated` : "", summary.skipped ? `${summary.skipped} skipped` : ""].filter(Boolean);
+      setNotice({ text: `Imported ${importers[job.kind].label} from ${job.fileName}: ${parts.join(", ")}.`, warnings: summary.warnings || [] });
+      await load();
+    } catch (reason) { setError(reason.message); } finally { setImporting(false); }
+  };
+  const importButton = (label) => <button className="secondary-button export-button" onClick={chooseImportFile} disabled={importing}>{importing ? <LoadingDots size={6} /> : <><UploadIcon /> {label}</>}</button>;
   const exportOverview = () => downloadCsv(`gdg-booth-overview-${exportStamp()}.csv`, [["Metric", "Value"], ["Total challenges", data.overview.totalChallenges ?? 0], ["Active challenges", data.overview.activeChallenges ?? 0], ["Question bank", data.overview.totalQuestions ?? 0], ["Answer attempts", data.overview.totalAttempts ?? 0], ["Participants", data.overview.totalParticipants ?? 0], ["Average score", data.overview.averageScore ?? 0]]);
   const exportChallenges = () => downloadCsv(`gdg-booth-challenges-${exportStamp()}.csv`, [["ID", "Title", "Description", "Image URL", "Difficulty", "Active", "Selection mode", "Question count", "Question IDs", "Random rules", "Leaderboard visible", "Require display name", "Time limit (seconds)", "Start message", "Completion message"], ...data.challenges.map((challenge) => [challenge.id, challenge.title, challenge.description ?? "", challenge.imageUrl ?? "", challenge.difficulty, challenge.isActive ? "Yes" : "No", challenge.selectionMode, challengeQuestionCount(challenge), (challenge.questionIds || []).join(" | "), JSON.stringify(challenge.randomRules || []), challenge.leaderboardEnabled ? "Yes" : "No", challenge.requireName ? "Yes" : "No", challenge.timeLimitSeconds ?? "", challenge.startMessage ?? "", challenge.completionMessage ?? ""])]);
   const exportQuestions = () => downloadCsv(
@@ -116,7 +195,7 @@ export default function AdminPage() {
   if (!auth) return <div className="admin-login"><div className="login-art"><Logo /><div><span className="eyebrow">Organizer access</span><h1>Keep the booth<br /><span>running smoothly.</span></h1><p>Create challenges, reuse questions, and watch results arrive in one focused dashboard.</p></div><div className="brand-dots large"><i /><i /><i /><i /></div></div><form className="login-form" onSubmit={login}><ThemeToggle darkMode={darkMode} onToggle={toggleTheme} disabled={savingTheme} /><div><h2>Admin dashboard</h2><p>Enter the shared organizer password to continue.</p></div><Field label="Admin password"><input className="text-input" type="password" autoFocus value={password} onChange={(event) => setPassword(event.target.value)} /></Field><ErrorBanner message={loginError} /><button className="primary-button large-button" disabled={!password || loggingIn}>{loggingIn ? <LoadingDots size={6} /> : "Continue"}</button><a href="/">← Back to leaderboard</a></form><GoogleBar /></div>;
 
   const titles = { overview: ["Overview", "A quick read on booth activity."], challenges: ["Challenges", "Create and configure the experiences visitors can start."], questions: ["Question bank", "Create once, then reuse questions across challenges."], results: ["Results", "Review or reset booth submissions and test runs."] };
-  return <div className="admin-shell"><div className="admin-body"><aside className={`admin-sidebar ${menuOpen ? "open" : ""}`}><Logo /><nav>{Object.keys(titles).map((key) => <button className={tab === key ? "active" : ""} key={key} onClick={() => { setTab(key); setMenuOpen(false); }}>{titles[key][0]}</button>)}</nav><div className="sidebar-footer"><StatusBadge tone="success">System online</StatusBadge><Link className="back-home-link" to="/">← Back to Home</Link><button className="text-button" onClick={logout}>Sign out</button></div></aside><div className="admin-content"><header className="admin-topbar"><button className="icon-button mobile-menu" onClick={() => setMenuOpen(!menuOpen)}><MenuIcon /></button><div><strong>GDG Booth Challenge</strong><small>Organizer workspace</small></div><ThemeToggle darkMode={darkMode} onToggle={toggleTheme} disabled={savingTheme} /></header><main className="admin-main"><div className="admin-page-header"><div><h1>{titles[tab][0]}</h1><p>{titles[tab][1]}</p></div><div className="admin-actions">{["questions", "results"].includes(tab) && <input className="search-input" placeholder="Search..." value={search} onChange={(event) => setSearch(event.target.value)} />}{tab === "overview" && <button className="secondary-button export-button" onClick={exportOverview}><DownloadIcon /> Export CSV</button>}{tab === "challenges" && <><button className="secondary-button export-button" onClick={exportChallenges} disabled={!data.challenges.length}><DownloadIcon /> Export CSV</button><button className="primary-button" onClick={() => setEditor({ kind: "challenge" })}>+ New challenge</button></>}{tab === "questions" && <><button className="secondary-button export-button" onClick={exportQuestions} disabled={!data.questions.length}><DownloadIcon /> Export CSV</button><button className="primary-button" onClick={() => setEditor({ kind: "question" })}>+ New question</button></>}{tab === "results" && <><button className="secondary-button export-button" onClick={exportResults} disabled={!data.results.length && !data.leaderboard.length}><DownloadIcon /> Export Excel</button>{data.results.length > 0 && <button className="secondary-button danger-outline" onClick={() => setDeleteTarget({ kind: "results", name: "all booth results" })}>Reset all</button>}</>}</div></div><ErrorBanner message={error} />{loading ? <div className="admin-loading"><LoadingDots label="Refreshing dashboard" size={10} /></div> : <>{tab === "overview" && <Overview data={data.overview} />}{tab === "challenges" && <div className="admin-list">{data.challenges.map((challenge) => { const difficulty = difficultyFor(challenge.difficulty); return <div className="admin-row" key={challenge.id}><span className="row-icon" style={{ color: difficulty.color, background: `${difficulty.color}18` }}>{challenge.title[0]}</span><span className="row-main"><strong>{challenge.title}</strong><small>{challenge.selectionMode === "manual" ? `${challenge.questionIds.length} questions` : "Random selection"}</small></span><span className="row-badges"><StatusBadge tone={difficulty.tone}>{challenge.difficulty}</StatusBadge><StatusBadge tone={challenge.isActive ? "success" : "neutral"}>{challenge.isActive ? "Active" : "Inactive"}</StatusBadge></span><span className="row-actions"><button className="text-button" onClick={() => setEditor({ kind: "challenge", value: challenge })}>Edit</button><button className="text-button" onClick={() => duplicate("challenges", challenge.id)}>Duplicate</button><button className="text-button danger-text" onClick={() => setDeleteTarget({ kind: "challenges", id: challenge.id, name: challenge.title })}>Delete</button></span></div>; })}</div>}{tab === "questions" && <div className="admin-list">{filteredQuestions.map((question) => { const difficulty = difficultyFor(question.difficulty); return <div className="admin-row question-row" key={question.id}><span className="row-icon" style={{ color: difficulty.color, background: `${difficulty.color}18` }}>Q</span><span className="row-main"><strong>{question.title}</strong><small>{pretty(question.type)} · {question.category} · {question.points} pts</small></span><span className="row-badges"><StatusBadge tone={difficulty.tone}>{question.difficulty}</StatusBadge>{!question.isActive && <StatusBadge tone="neutral">Inactive</StatusBadge>}</span><span className="row-actions"><button className="text-button" onClick={() => setEditor({ kind: "question", value: question })}>Edit</button><button className="text-button" onClick={() => duplicate("questions", question.id)}>Duplicate</button><button className="text-button danger-text" onClick={() => setDeleteTarget({ kind: "questions", id: question.id, name: question.title })}>Delete</button></span></div>; })}</div>}{tab === "results" && <div className="data-card"><div className="result-table head"><span>Participant</span><span>Challenge</span><span>Score</span><span>Status</span><span /></div>{filteredResults.map((result) => <div className="result-table" key={result.id}><strong>{result.displayName}</strong><span>{result.challengeTitle}</span><span>{result.score} / {result.totalPossible} <small>({result.percentage || 0}%)</small></span><StatusBadge tone={result.status === "completed" ? "success" : "warning"}>{result.status}</StatusBadge><button className="text-button danger-text" onClick={() => setDeleteTarget({ kind: "results", id: result.id, name: `${result.displayName}'s result` })}>Delete</button></div>)}</div>}</>}</main></div></div><GoogleBar />{editor?.kind === "question" && <QuestionForm initial={editor.value} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); }} />}{editor?.kind === "challenge" && <ChallengeForm initial={editor.value} questions={data.questions} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); }} />}<ConfirmDialog open={Boolean(deleteTarget)} title="Confirm deletion" message={`Delete ${deleteTarget?.name}? This cannot be undone.`} onCancel={() => setDeleteTarget(null)} onConfirm={performDelete} /></div>;
+  return <div className="admin-shell"><div className="admin-body"><aside className={`admin-sidebar ${menuOpen ? "open" : ""}`}><Logo /><nav>{Object.keys(titles).map((key) => <button className={tab === key ? "active" : ""} key={key} onClick={() => { setTab(key); setMenuOpen(false); }}>{titles[key][0]}</button>)}</nav><div className="sidebar-footer"><StatusBadge tone="success">System online</StatusBadge><Link className="back-home-link" to="/">← Back to Home</Link><button className="text-button" onClick={logout}>Sign out</button></div></aside><div className="admin-content"><header className="admin-topbar"><button className="icon-button mobile-menu" onClick={() => setMenuOpen(!menuOpen)}><MenuIcon /></button><div><strong>GDG Booth Challenge</strong><small>Organizer workspace</small></div><ThemeToggle darkMode={darkMode} onToggle={toggleTheme} disabled={savingTheme} /></header><main className="admin-main"><div className="admin-page-header"><div><h1>{titles[tab][0]}</h1><p>{titles[tab][1]}</p></div><div className="admin-actions">{["questions", "results"].includes(tab) && <input className="search-input" placeholder="Search..." value={search} onChange={(event) => setSearch(event.target.value)} />}{tab === "overview" && <button className="secondary-button export-button" onClick={exportOverview}><DownloadIcon /> Export CSV</button>}{tab === "challenges" && <><button className="secondary-button export-button" onClick={exportChallenges} disabled={!data.challenges.length}><DownloadIcon /> Export CSV</button>{importButton("Import CSV")}<button className="primary-button" onClick={() => setEditor({ kind: "challenge" })}>+ New challenge</button></>}{tab === "questions" && <><button className="secondary-button export-button" onClick={exportQuestions} disabled={!data.questions.length}><DownloadIcon /> Export CSV</button>{importButton("Import CSV")}<button className="primary-button" onClick={() => setEditor({ kind: "question" })}>+ New question</button></>}{tab === "results" && <><button className="secondary-button export-button" onClick={exportResults} disabled={!data.results.length && !data.leaderboard.length}><DownloadIcon /> Export Excel</button>{importButton("Import Excel")}{data.results.length > 0 && <button className="secondary-button danger-outline" onClick={() => setDeleteTarget({ kind: "results", name: "all booth results" })}>Reset all</button>}</>}</div><input ref={fileInput} type="file" hidden onChange={readImportFile} /></div><ErrorBanner message={error} />{notice && <div className="success-banner" role="status"><div>{notice.text}{notice.warnings.length > 0 && <ul>{notice.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}</div><button aria-label="Dismiss" onClick={() => setNotice(null)}><CloseIcon /></button></div>}{loading ? <div className="admin-loading"><LoadingDots label="Refreshing dashboard" size={10} /></div> : <>{tab === "overview" && <Overview data={data.overview} />}{tab === "challenges" && <div className="admin-list">{data.challenges.map((challenge) => { const difficulty = difficultyFor(challenge.difficulty); return <div className="admin-row" key={challenge.id}><span className="row-icon" style={{ color: difficulty.color, background: `${difficulty.color}18` }}>{challenge.title[0]}</span><span className="row-main"><strong>{challenge.title}</strong><small>{challenge.selectionMode === "manual" ? `${challenge.questionIds.length} questions` : "Random selection"}</small></span><span className="row-badges"><StatusBadge tone={difficulty.tone}>{challenge.difficulty}</StatusBadge><StatusBadge tone={challenge.isActive ? "success" : "neutral"}>{challenge.isActive ? "Active" : "Inactive"}</StatusBadge></span><span className="row-actions"><button className="text-button" onClick={() => setEditor({ kind: "challenge", value: challenge })}>Edit</button><button className="text-button" onClick={() => duplicate("challenges", challenge.id)}>Duplicate</button><button className="text-button danger-text" onClick={() => setDeleteTarget({ kind: "challenges", id: challenge.id, name: challenge.title })}>Delete</button></span></div>; })}</div>}{tab === "questions" && <div className="admin-list">{filteredQuestions.map((question) => { const difficulty = difficultyFor(question.difficulty); return <div className="admin-row question-row" key={question.id}><span className="row-icon" style={{ color: difficulty.color, background: `${difficulty.color}18` }}>Q</span><span className="row-main"><strong>{question.title}</strong><small>{pretty(question.type)} · {question.category} · {question.points} pts</small></span><span className="row-badges"><StatusBadge tone={difficulty.tone}>{question.difficulty}</StatusBadge>{!question.isActive && <StatusBadge tone="neutral">Inactive</StatusBadge>}</span><span className="row-actions"><button className="text-button" onClick={() => setEditor({ kind: "question", value: question })}>Edit</button><button className="text-button" onClick={() => duplicate("questions", question.id)}>Duplicate</button><button className="text-button danger-text" onClick={() => setDeleteTarget({ kind: "questions", id: question.id, name: question.title })}>Delete</button></span></div>; })}</div>}{tab === "results" && <div className="data-card"><div className="result-table head"><span>Participant</span><span>Challenge</span><span>Score</span><span>Status</span><span /></div>{filteredResults.map((result) => <div className="result-table" key={result.id}><strong>{result.displayName}</strong><span>{result.challengeTitle}</span><span>{result.score} / {result.totalPossible} <small>({result.percentage || 0}%)</small></span><StatusBadge tone={result.status === "completed" ? "success" : "warning"}>{result.status}</StatusBadge><button className="text-button danger-text" onClick={() => setDeleteTarget({ kind: "results", id: result.id, name: `${result.displayName}'s result` })}>Delete</button></div>)}</div>}</>}</main></div></div><GoogleBar />{editor?.kind === "question" && <QuestionForm initial={editor.value} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); }} />}{editor?.kind === "challenge" && <ChallengeForm initial={editor.value} questions={data.questions} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); }} />}<ConfirmDialog open={Boolean(pendingImport)} title="Import data" confirmLabel="Import" message={pendingImport ? `Import ${pendingImport.rows.length} row(s) from ${pendingImport.fileName}? Rows with an existing ID will be overwritten; new ones will be added.` : ""} onCancel={() => setPendingImport(null)} onConfirm={runImport} /><ConfirmDialog open={Boolean(deleteTarget)} title="Confirm deletion" message={`Delete ${deleteTarget?.name}? This cannot be undone.`} onCancel={() => setDeleteTarget(null)} onConfirm={performDelete} /></div>;
 }
 
 function LoadingScreenFallback() { return <div className="loading-screen"><LoadingDots label="Checking admin access" size={12} /><GoogleBar /></div>; }
